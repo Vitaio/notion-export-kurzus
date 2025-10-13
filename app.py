@@ -49,7 +49,7 @@ def login_form():
             else:
                 st.error("Hibás jelszó.")
 
-@st.cache_data(ttl=60)  # 60 mp cache a Notion lekérésekre
+@st.cache_resource  # <<--- FIX: erőforrás cache-hez (nem pickle-elhető objektum)
 def get_client() -> Client:
     if not NOTION_API_KEY:
         raise RuntimeError("A NOTION_API_KEY nincs beállítva (környezeti változó vagy Streamlit Secrets).")
@@ -108,18 +108,13 @@ def collect_used_ids_and_names() -> Tuple[Counter, Dict[str, Set[str]]]:
                     if name: names_seen_by_id[oid].add(name)
         elif ptype == "status":
             node = prop.get("status") or {}
-            oid, name = node.get("id"), (node.get("name") or "").strip()
+            oid, name = (node.get("id"), (node.get("name") or "").strip())
             if oid:
                 used_by_id[oid]+=1
                 if name: names_seen_by_id[oid].add(name)
     return used_by_id, names_seen_by_id
 
 def build_display_list() -> List[Tuple[str, int, Set[str]]]:
-    """
-    Vissza: [(display_name, count, canonical_names), ...]
-    - display_name: amit a listában mutatunk (DISPLAY_RENAMES alkalmazva)
-    - canonical_names: ezzel próbálunk szűrni (aktuális név + esetleges régi variánsok + reverse alias)
-    """
     used_by_id, names_seen = collect_used_ids_and_names()
     id2current = schema_id_to_current_name()
     reverse_alias = defaultdict(set)
@@ -128,7 +123,6 @@ def build_display_list() -> List[Tuple[str, int, Set[str]]]:
 
     display_items: Dict[str, Dict] = {}
     for oid, cnt in used_by_id.items():
-        # jelenlegi sémanév vagy oldalakon látott egyik név (árva fallback)
         current_candidates = names_seen.get(oid, set())
         current_name = id2current.get(oid) or (sorted(current_candidates)[0] if current_candidates else f"(árva {oid[:6]}...)")
         display_name = DISPLAY_RENAMES.get(current_name, current_name)
@@ -211,7 +205,6 @@ def blocks_to_md(block_id: str, depth:int=0) -> str:
 def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     ptype = get_property_type()
     client = get_client()
-    # próbáljunk végig több néven, első találat nyer
     pages: List[Dict] = []
     for nm in sorted(canonical_names, key=lambda s:(0 if s==display_name else 1, s)):
         try:
@@ -221,7 +214,6 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         if subset:
             pages = subset; break
 
-    # CSV összeállítása memóriában
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["oldal_cime", "tartalom"])
     writer.writeheader()
@@ -241,16 +233,14 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
 st.title("📦 Notion export – Kurzus")
 st.caption("Csak a jelenleg látható Kurzus-értékekből, jelszóval védve.")
 
-# Jelszó ellenőrzés
 if need_auth():
     if not APP_PASSWORD:
         st.warning("Admin: állítsd be az APP_PASSWORD környezeti változót vagy Streamlit Secrets-et a jelszóhoz.")
     login_form()
     st.stop()
 
-# fő felület
 try:
-    items = build_display_list()  # [(display_name, count, canon_set)]
+    items = build_display_list()
 except Exception as e:
     st.error(f"Hiba a Notion lekérésnél: {e}")
     st.stop()
@@ -259,25 +249,24 @@ if not items:
     st.info("Nem találtam Kurzus értékeket.")
     st.stop()
 
-# választó
-labels = [f"{name} ({count})" for name, count, _ in items]
+labels = [f\"{name} ({count})\" for name, count, _ in items]
 name_by_label = {labels[i]: items[i][0] for i in range(len(items))}
 canon_by_name = {items[i][0]: items[i][2] for i in range(len(items))}
 
-pick = st.multiselect("Válaszd ki, mit exportáljunk:", labels, max_selections=None)
+pick = st.multiselect(\"Válaszd ki, mit exportáljunk:\", labels, max_selections=None)
 
-if st.button("Exportálás (CSV)"):
+if st.button(\"Exportálás (CSV)\"):
     if not pick:
-        st.warning("Válassz legalább egy elemet.")
+        st.warning(\"Válassz legalább egy elemet.\")
     else:
         for lbl in pick:
             name = name_by_label[lbl]
             data = export_one(name, canon_by_name[name])
-            fname_safe = re.sub(r"[^\w\-. ]", "_", name).strip().replace(" ", "_")
+            fname_safe = re.sub(r\"[^\\w\\-. ]\", \"_\", name).strip().replace(\" \", \"_\")
             st.download_button(
-                label=f"Letöltés: {name}.csv",
+                label=f\"Letöltés: {name}.csv\",
                 data=data,
-                file_name=f"export_Kurzus_{fname_safe}_.csv",
-                mime="text/csv",
-                key=f"dl-{fname_safe}",
+                file_name=f\"export_Kurzus_{fname_safe}_.csv\",
+                mime=\"text/csv\",
+                key=f\"dl-{fname_safe}\",
             )
