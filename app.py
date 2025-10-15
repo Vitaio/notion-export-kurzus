@@ -3,7 +3,6 @@ import io
 import csv
 import time
 import re
-import json
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
@@ -16,8 +15,7 @@ from notion_client.errors import APIResponseError
 # Secrets → env bridge (Streamlit Cloud esetén hasznos)
 # ────────────────────────────────────────────────────────────────────────────────
 try:
-    for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD",
-              "NOTION_PROPERTY_NAME", "NOTION_SECTION_PROP", "NOTION_ORDER_PROP", "NOTION_SORTS"):
+    for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD", "NOTION_PROPERTY_NAME"):
         if k in st.secrets and not os.getenv(k):
             os.environ[k] = str(st.secrets[k])
 except Exception:
@@ -39,21 +37,15 @@ DISPLAY_RENAMES: Dict[str, str] = {
     "Marketing rendszerek": "Ügyfélszerző marketing rendszerek",
 }
 
-# CSV oszlopok – a korábbi mintával egyező snake_case
+# CSV oszlopok – egységes snake_case
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
-
-# Opcionális közvetlen felülírás (ha biztosan tudod a property-k pontos nevét)
-ENV_SECTION_PROP = os.getenv("NOTION_SECTION_PROP", "").strip()
-ENV_ORDER_PROP   = os.getenv("NOTION_ORDER_PROP", "").strip()
-
-# Opcionális rendezés felülírás (JSON string a Notion API "sorts" mező formátumában)
-ENV_SORTS_JSON = os.getenv("NOTION_SORTS", "").strip()
 
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Oldalbeállítás
 # ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Notion export – Kurzus", page_icon="📦", layout="centered")
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Autentikáció
@@ -76,6 +68,7 @@ def login_form() -> None:
             else:
                 st.error("Hibás jelszó.")
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Notion kliens és sémainformáció
 # ────────────────────────────────────────────────────────────────────────────────
@@ -85,20 +78,20 @@ def get_client() -> Client:
         raise RuntimeError("A NOTION_API_KEY nincs beállítva (környezeti változó vagy Streamlit Secrets).")
     return Client(auth=NOTION_API_KEY)
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def get_database_schema() -> Dict:
     if not DATABASE_ID:
         raise RuntimeError("A NOTION_DATABASE_ID nincs beállítva.")
     return get_client().databases.retrieve(database_id=DATABASE_ID)
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def get_property_type() -> Optional[str]:
     """A csoportosító property (PROPERTY_NAME) típusa: select / multi_select / status."""
     db = get_database_schema()
     p = (db.get("properties", {}) or {}).get(PROPERTY_NAME)
     return p.get("type") if p else None
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def schema_id_to_current_name() -> Dict[str, str]:
     """A PROPERTY_NAME opciók (id → jelenlegi név) táblája."""
     db = get_database_schema()
@@ -159,7 +152,8 @@ def query_filtered_pages(filter_: Dict, sorts: Optional[List[Dict]] = None) -> L
         cursor = resp.get("next_cursor")
     return results
 
-@st.cache_data(ttl=60)
+
+@st.cache_data(ttl=120)
 def collect_used_ids_and_names() -> Tuple[Counter, Dict[str, Set[str]]]:
     """
     A PROPERTY_NAME property-hez:
@@ -199,10 +193,13 @@ def collect_used_ids_and_names() -> Tuple[Counter, Dict[str, Set[str]]]:
 
     return used_by_id, names_seen_by_id
 
+
 def build_display_list() -> List[Tuple[str, int, Set[str]]]:
     """
     Visszaadja a megjelenítési listát:
       [(display_name, count, canonical_names), ...]
+      - display_name: amit a listában mutatunk (DISPLAY_RENAMES alkalmazva)
+      - canonical_names: ezzel próbálunk szűrni (aktuális név + esetleges régi variánsok + reverse aliasok)
     """
     used_by_id, names_seen = collect_used_ids_and_names()
     id2current = schema_id_to_current_name()
@@ -232,6 +229,7 @@ def build_display_list() -> List[Tuple[str, int, Set[str]]]:
     items.sort(key=lambda x: (-x[1], x[0].lower()))
     return items
 
+
 def build_filter(ptype: Optional[str], name: str) -> Dict:
     if ptype == "select":
         return {"property": PROPERTY_NAME, "select": {"equals": name}}
@@ -240,6 +238,7 @@ def build_filter(ptype: Optional[str], name: str) -> Dict:
     if ptype == "status":
         return {"property": PROPERTY_NAME, "status": {"equals": name}}
     return {"property": PROPERTY_NAME, "select": {"equals": name}}
+
 
 def extract_title(page: Dict) -> str:
     """Az oldal címének kinyerése."""
@@ -252,8 +251,18 @@ def extract_title(page: Dict) -> str:
     # fallback: ha a DB-ben konkrétan "Lecke címe" a title mező neve
     lekce = props.get("Lecke címe", {})
     if lekce.get("type") == "title" and lekce.get("title"):
-        return " ".join(x.get("plain_text") or "" for x in lekce["title"]).strip() or "Névtelen oldal"
+        return " ".join((x.get("plain_text") or "") for x in lekce["title"]).strip() or "Névtelen oldal"
     return "Névtelen oldal"
+
+
+def resolve_title_prop_name() -> str:
+    """A DB-ben lévő cím (title) típusú property NEVE (az API a property-névvel várja a sortot)."""
+    db = get_database_schema()
+    for pname, meta in (db.get("properties", {}) or {}).items():
+        if meta.get("type") == "title":
+            return pname
+    return ""  # extrém esetben üres (nem reális egy DB-nél)
+
 
 def format_rich_text(rt_list: List[Dict]) -> str:
     out = ""
@@ -262,6 +271,7 @@ def format_rich_text(rt_list: List[Dict]) -> str:
         href = r.get("href")
         out += f"[{t}]({href})" if href else t
     return out
+
 
 def blocks_to_md(block_id: str, depth: int = 0) -> str:
     """Az oldal/blokk gyerekeit markdownná alakítja rekurzívan."""
@@ -326,11 +336,12 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
 
     return "\n".join(lines)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Property felderítés „Szakasz” / „Sorszám” részére
 # ────────────────────────────────────────────────────────────────────────────────
 def _norm_key(s: str) -> str:
-    # ékezetek eltávolítása, lower, szóköz/alsóvonás törlése
+    # ékezetek eltávolítása, lower, szóköz/alsóvonás/dísz jelek törlése
     if not isinstance(s, str):
         s = str(s or "")
     s = unicodedata.normalize("NFD", s)
@@ -351,49 +362,43 @@ ORDER_TARGETS = [
 def resolve_section_and_order_props() -> Tuple[str, str]:
     """
     Visszaadja a Notion property kulcsnevét (pontosan), amit 'Szakasz' és 'Sorszám' alatt értsünk.
-    - Először ENV felülírás (ha van).
-    - Utána sémából név szerinti (ékezet/kis-nagybetű/stb.) keresés szinonimákkal.
+    - Név szerinti (ékezet/kis-nagybetű/stb.) keresés szinonimákkal.
     - Végül best-effort: 'select/multi_select/status' → szakasz; 'number' → sorszám.
     """
     db = get_database_schema()
     props: Dict[str, Dict] = db.get("properties", {}) or {}
 
-    if ENV_SECTION_PROP and ENV_SECTION_PROP in props:
-        sec_key = ENV_SECTION_PROP
-    else:
-        # név szerinti keresés
-        lookup = { _norm_key(k): k for k in props.keys() }
-        sec_key = ""
-        for cand in SECTION_TARGETS + ["szakasz"]:
-            key = lookup.get(_norm_key(cand))
-            if key:
-                sec_key = key
+    # Szakasz
+    lookup = { _norm_key(k): k for k in props.keys() }
+    sec_key = ""
+    for cand in SECTION_TARGETS + ["szakasz"]:
+        key = lookup.get(_norm_key(cand))
+        if key:
+            sec_key = key
+            break
+    if not sec_key:
+        # típus szerinti tipp: kategorizáló property
+        for k, v in props.items():
+            if v.get("type") in ("select", "multi_select", "status"):
+                sec_key = k
                 break
-        if not sec_key:
-            # típus szerinti tipp: kategorizáló property
-            for k, v in props.items():
-                if v.get("type") in ("select", "multi_select", "status"):
-                    sec_key = k
-                    break
 
-    if ENV_ORDER_PROP and ENV_ORDER_PROP in props:
-        ord_key = ENV_ORDER_PROP
-    else:
-        lookup = { _norm_key(k): k for k in props.keys() }
-        ord_key = ""
-        for cand in ORDER_TARGETS + ["sorszám", "sorszam"]:
-            key = lookup.get(_norm_key(cand))
-            if key:
-                ord_key = key
+    # Sorszám
+    ord_key = ""
+    for cand in ORDER_TARGETS + ["sorszám", "sorszam"]:
+        key = lookup.get(_norm_key(cand))
+        if key:
+            ord_key = key
+            break
+    if not ord_key:
+        # típus szerinti tipp: number property
+        for k, v in props.items():
+            if v.get("type") == "number":
+                ord_key = k
                 break
-        if not ord_key:
-            # típus szerinti tipp: number property
-            for k, v in props.items():
-                if v.get("type") == "number":
-                    ord_key = k
-                    break
 
     return (sec_key or ""), (ord_key or "")
+
 
 def format_property_for_csv(page: Dict, prop_name: str) -> str:
     """
@@ -460,32 +465,27 @@ def format_property_for_csv(page: Dict, prop_name: str) -> str:
     except Exception:
         return ""
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Rendezés (sorts) feloldása
+# Rendezés kiválasztása: 1) Sorszám property ↑  2) ABC cím szerint ↑
 # ────────────────────────────────────────────────────────────────────────────────
 def resolve_sorts(order_prop: Optional[str]) -> Tuple[List[Dict], str]:
     """
     Visszaadja a Notion API "sorts" listát és egy emberi leírást.
-    Prioritás:
-      1) ENV_SORTS_JSON ha megadott és érvényes
-      2) ha van 'order_prop' (number) → aszerint növekvő
-      3) fallback: created_time növekvő
+    Követelmény:
+      1) Ha van 'Sorszám' property → aszerint növekvő
+      2) Ha nincs → cím (title property) szerint ABC (növekvő)
     """
-    # 1) explicit env
-    if ENV_SORTS_JSON:
-        try:
-            sorts = json.loads(ENV_SORTS_JSON)
-            if isinstance(sorts, list) and all(isinstance(x, dict) for x in sorts):
-                return sorts, f"ENV NOTION_SORTS ({ENV_SORTS_JSON})"
-        except Exception:
-            pass
-
-    # 2) van számozó property → aszerint
     if order_prop:
         return [{"property": order_prop, "direction": "ascending"}], f"property: {order_prop} ↑"
 
-    # 3) fallback
-    return [{"timestamp": "created_time", "direction": "ascending"}], "created_time ↑"
+    title_prop = resolve_title_prop_name()
+    if title_prop:
+        return [{"property": title_prop, "direction": "ascending"}], f"title: {title_prop} ↑"
+
+    # legvégső fallback – nem valószínű, hogy kell
+    return [], "unspecified (API default)"
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Export
@@ -494,13 +494,16 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     """
     Egy megjelenítési csoport (display_name) exportja CSV-be.
     A 'canonical_names' listán végigpróbál szűrni – az első találatot exportálja.
+    Rendezés:
+      - ha van dedikált 'Sorszám' property → annak értéke szerint növekvő
+      - különben: cím (title) szerint ABC
     A CSV 'sorszam' mező:
-      - ha van dedikált 'Sorszám' (number) property → annak értéke,
-      - különben a rendezett találatok 1..N indexe (position).
+      - ha van 'Sorszám' property → annak értéke,
+      - különben üres (mert nincs explicit sorszám a DB-ben).
     """
     ptype = get_property_type()
     section_prop, order_prop = resolve_section_and_order_props()
-    sorts, sorts_desc = resolve_sorts(order_prop)
+    sorts, _sort_desc = resolve_sorts(order_prop)
 
     # próbáljunk végig több néven, első találat nyer
     pages: List[Dict] = []
@@ -513,15 +516,12 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
             pages = subset
             break
 
-    # CSV összeállítása memóriában – a kért snake_case fejlécekkel
+    # CSV összeállítása memóriában
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_FIELDNAMES)
     writer.writeheader()
 
-    # ha van dedikált sorszám property, azt írjuk; különben pozíció
-    use_position_index = not bool(order_prop)
-
-    for idx, page in enumerate(pages, start=1):
+    for page in pages:
         pid   = page.get("id")
         title = extract_title(page)
         try:
@@ -529,11 +529,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         except Exception as e:
             content = f"[HIBA: {e}]"
 
-        sorszam_value = ""
-        if use_position_index:
-            sorszam_value = str(idx)
-        else:
-            sorszam_value = format_property_for_csv(page, order_prop)  # type: ignore
+        sorszam_value = format_property_for_csv(page, order_prop) if order_prop else ""
 
         row = {
             "oldal_cime": title,
@@ -546,11 +542,12 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
 
     return buf.getvalue().encode("utf-8")
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("A kiválasztott „Kurzus” csoport(ok) oldalait CSV-be exportálja. (Jelszóval védve.)")
+st.caption("A kiválasztott „Kurzus” csoport(ok) oldalait CSV-be exportálja. Rendezés: Sorszám ↑, különben ABC cím ↑.")
 
 # Jelszó
 if need_auth():
@@ -579,8 +576,8 @@ canon_by_name = {items[i][0]: items[i][2] for i in range(len(items))}
 sec_prop, ord_prop = resolve_section_and_order_props()
 sorts, sorts_desc = resolve_sorts(ord_prop)
 with st.expander("Részletek (felismert mezők és rendezés)"):
-    st.write(f"**Szakasz mező**: `{sec_prop or '— (nem találtam; üres lesz)'}`")
-    st.write(f"**Sorszám mező**: `{ord_prop or '— (nincs; pozíciót fogunk írni)'}`")
+    st.write(f"**Szakasz mező**: `{sec_prop or '— (nem találtam; üres lesz a CSV-ben)'}`")
+    st.write(f"**Sorszám mező**: `{ord_prop or '— (nincs; ABC cím szerint rendezünk)'}`")
     st.write(f"**Rendezés**: {sorts_desc}")
 
 pick = st.multiselect("Válaszd ki, mit exportáljunk:", labels, max_selections=None)
