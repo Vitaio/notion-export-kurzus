@@ -254,7 +254,6 @@ def extract_title(page: Dict) -> str:
         return " ".join((x.get("plain_text") or "") for x in lekce["title"]).strip() or "Névtelen oldal"
     return "Névtelen oldal"
 
-
 def resolve_title_prop_name() -> str:
     """A DB-ben lévő cím (title) típusú property NEVE (az API a property-névvel várja a sortot)."""
     db = get_database_schema()
@@ -262,7 +261,6 @@ def resolve_title_prop_name() -> str:
         if meta.get("type") == "title":
             return pname
     return ""  # extrém esetben üres (nem reális egy DB-nél)
-
 
 def format_rich_text(rt_list: List[Dict]) -> str:
     out = ""
@@ -488,18 +486,76 @@ def resolve_sorts(order_prop: Optional[str]) -> Tuple[List[Dict], str]:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Markdown szűrés: csak „Videó szöveg” vagy – ha az üres – „Lecke szöveg”
+# ────────────────────────────────────────────────────────────────────────────────
+def _normalize(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.strip().lower()
+
+def _split_h2_sections(md: str) -> Dict[str, List[str]]:
+    """
+    H2 (##) címek mentén darabol, a kulcs a H2 címsor szövege (heading nélkül).
+    A tartalom NEM tartalmazza a H2 sort, csak az utána jövő sorokat a következő H2-ig.
+    """
+    sections: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in (md or "").splitlines():
+        m = re.match(r"^\s*##\s+(.*)\s*$", line)
+        if m:
+            title = m.group(1).strip()
+            current = title
+            sections.setdefault(title, [])
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return sections
+
+def _join(lines: List[str]) -> str:
+    return "\n".join(lines).strip()
+
+def select_video_or_lesson(md: str) -> str:
+    """
+    Logika:
+      - Ha a „Videó szöveg” rész tartalma NEM üres → csak azt adja vissza.
+      - Egyébként, ha a „Lecke szöveg” NEM üres → csak azt adja vissza.
+      - Különben üres string.
+    A „Megjegyzés” és más H2 részek figyelmen kívül maradnak.
+    """
+    sections = _split_h2_sections(md)
+
+    # kulcsok normalizálása a biztos egyezéshez
+    norm_map = { _normalize(k): k for k in sections.keys() }
+
+    video_key  = norm_map.get(_normalize("Videó szöveg"))
+    lesson_key = norm_map.get(_normalize("Lecke szöveg"))
+
+    video_txt  = _join(sections.get(video_key, [])) if video_key else ""
+    lesson_txt = _join(sections.get(lesson_key, [])) if lesson_key else ""
+
+    if re.search(r"\S", video_txt or ""):
+        return video_txt
+    if re.search(r"\S", lesson_txt or ""):
+        return lesson_txt
+    return ""
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Export
 # ────────────────────────────────────────────────────────────────────────────────
 def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     """
     Egy megjelenítési csoport (display_name) exportja CSV-be.
-    A 'canonical_names' listán végigpróbál szűrni – az első találatot exportálja.
     Rendezés:
       - ha van dedikált 'Sorszám' property → annak értéke szerint növekvő
       - különben: cím (title) szerint ABC
+    A CSV 'tartalom' mező:
+      - csak a „Videó szöveg” H2 alatti rész, HA az nem üres;
+      - különben a „Lecke szöveg” H2 alatti rész (ha nem üres);
+      - különben üres.
     A CSV 'sorszam' mező:
       - ha van 'Sorszám' property → annak értéke,
-      - különben üres (mert nincs explicit sorszám a DB-ben).
+      - különben üres (nincs explicit sorszám a DB-ben).
     """
     ptype = get_property_type()
     section_prop, order_prop = resolve_section_and_order_props()
@@ -525,7 +581,8 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         pid   = page.get("id")
         title = extract_title(page)
         try:
-            content = blocks_to_md(pid).strip()
+            raw_md = blocks_to_md(pid).strip()
+            content = select_video_or_lesson(raw_md)  # <-- itt történik a feltételes kivágás
         except Exception as e:
             content = f"[HIBA: {e}]"
 
@@ -547,7 +604,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
 # UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("A kiválasztott „Kurzus” csoport(ok) oldalait CSV-be exportálja. Rendezés: Sorszám ↑, különben ABC cím ↑.")
+st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” csak a Videó szöveg vagy – ha az üres – a Lecke szöveg H2 alatti része.")
 
 # Jelszó
 if need_auth():
