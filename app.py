@@ -274,16 +274,16 @@ def format_rich_text(rt_list: List[Dict]) -> str:
 def blocks_to_md(block_id: str, depth: int = 0) -> str:
     """
     Az oldal/blokk gyerekeit markdownná alakítja rekurzívan.
-    JAVÍTVA: a számozott listák (numbered_list_item) most már 1., 2., 3. ... formában kerülnek ki,
-    nem minden elem „1.”-ként.
+
+    FIGYELEM: a Notion API "numbered_list_item" blokkokat ad vissza, és a hagyományos markdownban
+    gyakori, hogy minden elem "1."-ként kerül kiírva. Mi itt szándékosan MINDIG "1."-et írunk ki,
+    majd a teljes szöveg összeállítása UTÁN, egy külön lépésben újraszámozzuk a listákat
+    (fix_numbered_lists), így a beágyazott tartalom és a lapozás sem zavarja össze a számlálót.
     """
     client = get_client()
     lines: List[str] = []
     cursor = None
     indent = "  " * depth
-
-    # számozott lista számláló a JELENLEGI szinten (a rekurzió minden szinten külön számlálót kap)
-    numbered_counter = 0
 
     while True:
         resp = with_backoff(client.blocks.children.list, block_id=block_id, start_cursor=cursor)
@@ -299,56 +299,31 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
             ):
                 txt = format_rich_text(data.get("rich_text", []))
                 prefix = ""
-
-                if   btype == "heading_1":
-                    prefix = "# "
-                    numbered_counter = 0  # megszakítja a számozott listát
-                elif btype == "heading_2":
-                    prefix = "## "
-                    numbered_counter = 0
-                elif btype == "heading_3":
-                    prefix = "### "
-                    numbered_counter = 0
-                elif btype == "bulleted_list_item":
-                    prefix = "- "
-                    numbered_counter = 0
-                elif btype == "numbered_list_item":
-                    numbered_counter += 1
-                    prefix = f"{numbered_counter}. "
-                elif btype == "quote":
-                    prefix = "> "
-                    numbered_counter = 0
-                elif btype == "to_do":
-                    prefix = "- [x] " if data.get("checked") else "- [ ] "
-                    numbered_counter = 0
-                elif btype == "callout":
-                    prefix = "💡 "
-                    numbered_counter = 0
-                elif btype == "toggle":
-                    prefix = "▶ "
-                    numbered_counter = 0
-
+                if   btype == "heading_1":          prefix = "# "
+                elif btype == "heading_2":          prefix = "## "
+                elif btype == "heading_3":          prefix = "### "
+                elif btype == "bulleted_list_item": prefix = "- "
+                elif btype == "numbered_list_item": prefix = "1. "  # ← mindig 1., később renumber
+                elif btype == "quote":              prefix = "> "
+                elif btype == "to_do":              prefix = "- [x] " if data.get("checked") else "- [ ] "
+                elif btype == "callout":            prefix = "💡 "
+                elif btype == "toggle":             prefix = "▶ "
                 if txt or prefix:
                     line = f"{indent}{prefix}{txt}"
 
             elif btype == "code":
-                # bármilyen nem-lista típus megszakítja a számozást
-                numbered_counter = 0
                 lang = data.get("language", "") or ""
                 inner = format_rich_text(data.get("rich_text", []))
                 line = f"{indent}```{lang}\n{inner}\n```"
 
             elif btype == "equation":
-                numbered_counter = 0
                 expr = data.get("expression", "") or ""
                 line = f"{indent}$$ {expr} $$"
 
             elif btype == "divider":
-                numbered_counter = 0
                 line = f"{indent}---"
 
             elif btype in ("image", "video", "file", "pdf"):
-                numbered_counter = 0
                 cap = format_rich_text(data.get("caption", []))
                 line = f"{indent}*[{btype.upper()}]* {cap}".rstrip()
 
@@ -356,7 +331,6 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
                 lines.append(line)
 
             if block.get("has_children"):
-                # gyermekek feldolgozása – külön szint, ezért ott új számláló indul
                 child = blocks_to_md(block["id"], depth + 1)
                 if child.strip():
                     lines.append(child)
@@ -519,7 +493,7 @@ def resolve_sorts(order_prop: Optional[str]) -> Tuple[List[Dict], str]:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Markdown szűrés: csak „Videó szöveg” vagy – ha az üres – „Lecke szöveg”
+# Markdown szűrés + számozott listák ÚJRASZÁMOZÁSA
 # ────────────────────────────────────────────────────────────────────────────────
 def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFD", s or "")
@@ -547,17 +521,84 @@ def _split_h2_sections(md: str) -> Dict[str, List[str]]:
 def _join(lines: List[str]) -> str:
     return "\n".join(lines).strip()
 
+def fix_numbered_lists(md: str) -> str:
+    """
+    ÚJRASZÁMOZÁS:
+      - csak azokat a sorokat módosítja, amelyek *szóközök után* közvetlenül „szám + . + szóköz” mintával kezdődnek.
+      - figyeli a kódblokkokat (```), azokat érintetlenül hagyja.
+      - kezeli a beágyazott tartalmat: a listához tartozó, de jobban behúzott sorok (pl. a listapont alatti bekezdés)
+        nem szakítják meg a számozást.
+    """
+    lines = (md or "").splitlines()
+    out: List[str] = []
+    in_code = False
+    fence_re = re.compile(r'^\s*```')
+    num_re = re.compile(r'^(\s*)(\d+)\.\s(.*)$')
+
+    active_list_indent: Optional[int] = None  # hány space a numerikus pontoknál
+    counter_for_indent: Dict[int, int] = {}
+
+    for line in lines:
+        # kódblokk nyit/zár
+        if fence_re.match(line):
+            in_code = not in_code
+            out.append(line)
+            # kódblokk sorai ne befolyásolják a listaszámlálót
+            continue
+
+        if in_code:
+            out.append(line)
+            continue
+
+        m = num_re.match(line)
+        if m:
+            indent_str = m.group(1)
+            indent_len = len(indent_str)
+            content = m.group(3)
+
+            # új lista vagy új szint?
+            if active_list_indent is None or indent_len != active_list_indent:
+                # új lista ezen az indenten
+                active_list_indent = indent_len
+                # töröljük a mélyebb számlálókat
+                for k in list(counter_for_indent.keys()):
+                    if k >= indent_len:
+                        del counter_for_indent[k]
+                counter_for_indent[indent_len] = 1
+            else:
+                # folytatólagos elem ugyanazon az indenten
+                counter_for_indent[indent_len] = counter_for_indent.get(indent_len, 0) + 1
+
+            n = counter_for_indent[indent_len]
+            out.append(f"{indent_str}{n}. {content}")
+        else:
+            # nem számozott sor: eldöntjük, hogy a listán belüli tartalom-e
+            if active_list_indent is not None:
+                leading_spaces = len(line) - len(line.lstrip(" "))
+                if line.strip() == "":
+                    # üres sor: listát nem szakítjuk meg
+                    out.append(line)
+                    continue
+                if leading_spaces > active_list_indent:
+                    # a jelenlegi listapont alatti „tartalom” → marad a lista aktív
+                    out.append(line)
+                    continue
+                # ide érve vagy kisebb/egyenlő indent, vagy nincs indent → vége a listának
+                active_list_indent = None
+                counter_for_indent.clear()
+
+            out.append(line)
+
+    return "\n".join(out)
+
 def select_video_or_lesson(md: str) -> str:
     """
     Logika:
-      - Ha a „Videó szöveg” rész tartalma NEM üres → csak azt adja vissza.
-      - Egyébként, ha a „Lecke szöveg” NEM üres → csak azt adja vissza.
+      - Ha a „Videó szöveg” rész tartalma NEM üres → csak azt adja vissza (újraszámozva).
+      - Egyébként, ha a „Lecke szöveg” NEM üres → csak azt adja vissza (újraszámozva).
       - Különben üres string.
-    A „Megjegyzés” és más H2 részek figyelmen kívül maradnak.
     """
     sections = _split_h2_sections(md)
-
-    # kulcsok normalizálása a biztos egyezéshez
     norm_map = { _normalize(k): k for k in sections.keys() }
 
     video_key  = norm_map.get(_normalize("Videó szöveg"))
@@ -567,9 +608,9 @@ def select_video_or_lesson(md: str) -> str:
     lesson_txt = _join(sections.get(lesson_key, [])) if lesson_key else ""
 
     if re.search(r"\S", video_txt or ""):
-        return video_txt
+        return fix_numbered_lists(video_txt)
     if re.search(r"\S", lesson_txt or ""):
-        return lesson_txt
+        return fix_numbered_lists(lesson_txt)
     return ""
 
 
@@ -586,6 +627,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
       - csak a „Videó szöveg” H2 alatti rész, HA az nem üres;
       - különben a „Lecke szöveg” H2 alatti rész (ha nem üres);
       - különben üres.
+      - a számozott listákat mindig 1., 2., 3. … formára újraszámozzuk (fix_numbered_lists).
     A CSV 'sorszam' mező:
       - ha van 'Sorszám' property → annak értéke,
       - különben üres (nincs explicit sorszám a DB-ben).
@@ -615,7 +657,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         title = extract_title(page)
         try:
             raw_md = blocks_to_md(pid).strip()
-            content = select_video_or_lesson(raw_md)  # feltételes kivágás
+            content = select_video_or_lesson(raw_md)  # feltételes kivágás + újraszámozás
         except Exception as e:
             content = f"[HIBA: {e}]"
 
@@ -637,7 +679,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
 # UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” csak a Videó szöveg vagy – ha az üres – a Lecke szöveg H2 alatti része. A számozott listák 1., 2., 3. formátumúak.")
+st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a Videó szöveg (ha üres: Lecke szöveg) – a számozott listák automatikusan 1., 2., 3.… formára újraszámozva.")
 
 # Jelszó
 if need_auth():
