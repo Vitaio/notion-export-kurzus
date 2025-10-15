@@ -272,11 +272,18 @@ def format_rich_text(rt_list: List[Dict]) -> str:
 
 
 def blocks_to_md(block_id: str, depth: int = 0) -> str:
-    """Az oldal/blokk gyerekeit markdownná alakítja rekurzívan."""
+    """
+    Az oldal/blokk gyerekeit markdownná alakítja rekurzívan.
+    JAVÍTVA: a számozott listák (numbered_list_item) most már 1., 2., 3. ... formában kerülnek ki,
+    nem minden elem „1.”-ként.
+    """
     client = get_client()
     lines: List[str] = []
     cursor = None
     indent = "  " * depth
+
+    # számozott lista számláló a JELENLEGI szinten (a rekurzió minden szinten külön számlálót kap)
+    numbered_counter = 0
 
     while True:
         resp = with_backoff(client.blocks.children.list, block_id=block_id, start_cursor=cursor)
@@ -292,31 +299,56 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
             ):
                 txt = format_rich_text(data.get("rich_text", []))
                 prefix = ""
-                if   btype == "heading_1":          prefix = "# "
-                elif btype == "heading_2":          prefix = "## "
-                elif btype == "heading_3":          prefix = "### "
-                elif btype == "bulleted_list_item": prefix = "- "
-                elif btype == "numbered_list_item": prefix = "1. "
-                elif btype == "quote":              prefix = "> "
-                elif btype == "to_do":              prefix = "- [x] " if data.get("checked") else "- [ ] "
-                elif btype == "callout":            prefix = "💡 "
-                elif btype == "toggle":             prefix = "▶ "
+
+                if   btype == "heading_1":
+                    prefix = "# "
+                    numbered_counter = 0  # megszakítja a számozott listát
+                elif btype == "heading_2":
+                    prefix = "## "
+                    numbered_counter = 0
+                elif btype == "heading_3":
+                    prefix = "### "
+                    numbered_counter = 0
+                elif btype == "bulleted_list_item":
+                    prefix = "- "
+                    numbered_counter = 0
+                elif btype == "numbered_list_item":
+                    numbered_counter += 1
+                    prefix = f"{numbered_counter}. "
+                elif btype == "quote":
+                    prefix = "> "
+                    numbered_counter = 0
+                elif btype == "to_do":
+                    prefix = "- [x] " if data.get("checked") else "- [ ] "
+                    numbered_counter = 0
+                elif btype == "callout":
+                    prefix = "💡 "
+                    numbered_counter = 0
+                elif btype == "toggle":
+                    prefix = "▶ "
+                    numbered_counter = 0
+
                 if txt or prefix:
                     line = f"{indent}{prefix}{txt}"
 
             elif btype == "code":
+                # bármilyen nem-lista típus megszakítja a számozást
+                numbered_counter = 0
                 lang = data.get("language", "") or ""
                 inner = format_rich_text(data.get("rich_text", []))
                 line = f"{indent}```{lang}\n{inner}\n```"
 
             elif btype == "equation":
+                numbered_counter = 0
                 expr = data.get("expression", "") or ""
                 line = f"{indent}$$ {expr} $$"
 
             elif btype == "divider":
+                numbered_counter = 0
                 line = f"{indent}---"
 
             elif btype in ("image", "video", "file", "pdf"):
+                numbered_counter = 0
                 cap = format_rich_text(data.get("caption", []))
                 line = f"{indent}*[{btype.upper()}]* {cap}".rstrip()
 
@@ -324,6 +356,7 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
                 lines.append(line)
 
             if block.get("has_children"):
+                # gyermekek feldolgozása – külön szint, ezért ott új számláló indul
                 child = blocks_to_md(block["id"], depth + 1)
                 if child.strip():
                     lines.append(child)
@@ -582,7 +615,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         title = extract_title(page)
         try:
             raw_md = blocks_to_md(pid).strip()
-            content = select_video_or_lesson(raw_md)  # <-- itt történik a feltételes kivágás
+            content = select_video_or_lesson(raw_md)  # feltételes kivágás
         except Exception as e:
             content = f"[HIBA: {e}]"
 
@@ -604,7 +637,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
 # UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” csak a Videó szöveg vagy – ha az üres – a Lecke szöveg H2 alatti része.")
+st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” csak a Videó szöveg vagy – ha az üres – a Lecke szöveg H2 alatti része. A számozott listák 1., 2., 3. formátumúak.")
 
 # Jelszó
 if need_auth():
