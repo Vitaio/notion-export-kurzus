@@ -3,6 +3,7 @@ import io
 import csv
 import time
 import re
+import json
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
@@ -16,7 +17,7 @@ from notion_client.errors import APIResponseError
 # ────────────────────────────────────────────────────────────────────────────────
 try:
     for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD",
-              "NOTION_PROPERTY_NAME", "NOTION_SECTION_PROP", "NOTION_ORDER_PROP"):
+              "NOTION_PROPERTY_NAME", "NOTION_SECTION_PROP", "NOTION_ORDER_PROP", "NOTION_SORTS"):
         if k in st.secrets and not os.getenv(k):
             os.environ[k] = str(st.secrets[k])
 except Exception:
@@ -38,12 +39,15 @@ DISPLAY_RENAMES: Dict[str, str] = {
     "Marketing rendszerek": "Ügyfélszerző marketing rendszerek",
 }
 
-# CSV oszlopok – a mellékelt mintával egyező snake_case
+# CSV oszlopok – a korábbi mintával egyező snake_case
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 
 # Opcionális közvetlen felülírás (ha biztosan tudod a property-k pontos nevét)
 ENV_SECTION_PROP = os.getenv("NOTION_SECTION_PROP", "").strip()
 ENV_ORDER_PROP   = os.getenv("NOTION_ORDER_PROP", "").strip()
+
+# Opcionális rendezés felülírás (JSON string a Notion API "sorts" mező formátumában)
+ENV_SORTS_JSON = os.getenv("NOTION_SORTS", "").strip()
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -122,12 +126,33 @@ def with_backoff(fn, *args, retries: int = 5, **kwargs):
             raise
 
 def query_all_pages() -> List[Dict]:
-    """Az adatbázis minden oldalát lekéri lapozással."""
+    """Az adatbázis minden oldalát lekéri lapozással (általános – NINCS szűrés/rendezés)."""
     client = get_client()
     results: List[Dict] = []
     cursor = None
     while True:
-        resp = with_backoff(client.databases.query, database_id=DATABASE_ID, start_cursor=cursor)
+        resp = with_backoff(client.databases.query, database_id=DATABASE_ID, start_cursor=cursor, page_size=100)
+        results.extend(resp.get("results", []) or [])
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+    return results
+
+def query_filtered_pages(filter_: Dict, sorts: Optional[List[Dict]] = None) -> List[Dict]:
+    """Szűrt lekérdezés lapozással, opcionális rendezéssel (sorts)."""
+    client = get_client()
+    results: List[Dict] = []
+    cursor = None
+    while True:
+        kwargs = {
+            "database_id": DATABASE_ID,
+            "filter": filter_,
+            "start_cursor": cursor,
+            "page_size": 100
+        }
+        if sorts:
+            kwargs["sorts"] = sorts
+        resp = with_backoff(client.databases.query, **kwargs)
         results.extend(resp.get("results", []) or [])
         if not resp.get("has_more"):
             break
@@ -227,7 +252,7 @@ def extract_title(page: Dict) -> str:
     # fallback: ha a DB-ben konkrétan "Lecke címe" a title mező neve
     lekce = props.get("Lecke címe", {})
     if lekce.get("type") == "title" and lekce.get("title"):
-        return " ".join(x.get("plain_text", "") for x in lekce["title"]).strip() or "Névtelen oldal"
+        return " ".join(x.get("plain_text") or "" for x in lekce["title"]).strip() or "Névtelen oldal"
     return "Névtelen oldal"
 
 def format_rich_text(rt_list: List[Dict]) -> str:
@@ -436,26 +461,52 @@ def format_property_for_csv(page: Dict, prop_name: str) -> str:
         return ""
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Rendezés (sorts) feloldása
+# ────────────────────────────────────────────────────────────────────────────────
+def resolve_sorts(order_prop: Optional[str]) -> Tuple[List[Dict], str]:
+    """
+    Visszaadja a Notion API "sorts" listát és egy emberi leírást.
+    Prioritás:
+      1) ENV_SORTS_JSON ha megadott és érvényes
+      2) ha van 'order_prop' (number) → aszerint növekvő
+      3) fallback: created_time növekvő
+    """
+    # 1) explicit env
+    if ENV_SORTS_JSON:
+        try:
+            sorts = json.loads(ENV_SORTS_JSON)
+            if isinstance(sorts, list) and all(isinstance(x, dict) for x in sorts):
+                return sorts, f"ENV NOTION_SORTS ({ENV_SORTS_JSON})"
+        except Exception:
+            pass
+
+    # 2) van számozó property → aszerint
+    if order_prop:
+        return [{"property": order_prop, "direction": "ascending"}], f"property: {order_prop} ↑"
+
+    # 3) fallback
+    return [{"timestamp": "created_time", "direction": "ascending"}], "created_time ↑"
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Export
 # ────────────────────────────────────────────────────────────────────────────────
 def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     """
     Egy megjelenítési csoport (display_name) exportja CSV-be.
     A 'canonical_names' listán végigpróbál szűrni – az első találatot exportálja.
+    A CSV 'sorszam' mező:
+      - ha van dedikált 'Sorszám' (number) property → annak értéke,
+      - különben a rendezett találatok 1..N indexe (position).
     """
     ptype = get_property_type()
-    client = get_client()
     section_prop, order_prop = resolve_section_and_order_props()
+    sorts, sorts_desc = resolve_sorts(order_prop)
 
     # próbáljunk végig több néven, első találat nyer
     pages: List[Dict] = []
     for nm in sorted(canonical_names, key=lambda s: (0 if s == display_name else 1, s)):
         try:
-            subset = with_backoff(
-                client.databases.query,
-                database_id=DATABASE_ID,
-                filter=build_filter(ptype, nm)
-            ).get("results", [])
+            subset = query_filtered_pages(filter_=build_filter(ptype, nm), sorts=sorts)
         except APIResponseError:
             subset = []
         if subset:
@@ -467,7 +518,10 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     writer = csv.DictWriter(buf, fieldnames=CSV_FIELDNAMES)
     writer.writeheader()
 
-    for page in pages:
+    # ha van dedikált sorszám property, azt írjuk; különben pozíció
+    use_position_index = not bool(order_prop)
+
+    for idx, page in enumerate(pages, start=1):
         pid   = page.get("id")
         title = extract_title(page)
         try:
@@ -475,14 +529,20 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         except Exception as e:
             content = f"[HIBA: {e}]"
 
+        sorszam_value = ""
+        if use_position_index:
+            sorszam_value = str(idx)
+        else:
+            sorszam_value = format_property_for_csv(page, order_prop)  # type: ignore
+
         row = {
             "oldal_cime": title,
             "szakasz": format_property_for_csv(page, section_prop),
-            "sorszam": format_property_for_csv(page, order_prop),
+            "sorszam": sorszam_value,
             "tartalom": content,
         }
         writer.writerow(row)
-        time.sleep(0.02)  # udvarias tempó
+        time.sleep(0.01)  # udvarias tempó
 
     return buf.getvalue().encode("utf-8")
 
@@ -515,13 +575,13 @@ labels = [f"{name} ({count})" for name, count, _ in items]
 name_by_label = {labels[i]: items[i][0] for i in range(len(items))}
 canon_by_name = {items[i][0]: items[i][2] for i in range(len(items))}
 
-# Tájékoztatás: mely property-t találtunk „Szakasz”/„Sorszám” néven
+# Tájékoztatás: mely property-t/sortot használunk
 sec_prop, ord_prop = resolve_section_and_order_props()
-with st.expander("Részletek (felismert Notion property-k)"):
+sorts, sorts_desc = resolve_sorts(ord_prop)
+with st.expander("Részletek (felismert mezők és rendezés)"):
     st.write(f"**Szakasz mező**: `{sec_prop or '— (nem találtam; üres lesz)'}`")
-    st.write(f"**Sorszám mező**: `{ord_prop or '— (nem találtam; üres lesz)'}`")
-    if ENV_SECTION_PROP or ENV_ORDER_PROP:
-        st.caption("Megjegyzés: a fenti érték(ek) env-ben felül lettek írva.")
+    st.write(f"**Sorszám mező**: `{ord_prop or '— (nincs; pozíciót fogunk írni)'}`")
+    st.write(f"**Rendezés**: {sorts_desc}")
 
 pick = st.multiselect("Válaszd ki, mit exportáljunk:", labels, max_selections=None)
 
