@@ -275,10 +275,8 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
     """
     Az oldal/blokk gyerekeit markdownná alakítja rekurzívan.
 
-    FIGYELEM: a Notion API "numbered_list_item" blokkokat ad vissza, és a hagyományos markdownban
-    gyakori, hogy minden elem "1."-ként kerül kiírva. Mi itt szándékosan MINDIG "1."-et írunk ki,
-    majd a teljes szöveg összeállítása UTÁN, egy külön lépésben újraszámozzuk a listákat
-    (fix_numbered_lists), így a beágyazott tartalom és a lapozás sem zavarja össze a számlálót.
+    A számozott lista elemeket mindig „1.”-ként írjuk ki, majd a teljes szöveget
+    a végén újraszámozzuk (fix_numbered_lists), így a lapozás és beágyazás nem zavarja össze.
     """
     client = get_client()
     lines: List[str] = []
@@ -303,7 +301,7 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
                 elif btype == "heading_2":          prefix = "## "
                 elif btype == "heading_3":          prefix = "### "
                 elif btype == "bulleted_list_item": prefix = "- "
-                elif btype == "numbered_list_item": prefix = "1. "  # ← mindig 1., később renumber
+                elif btype == "numbered_list_item": prefix = "1. "
                 elif btype == "quote":              prefix = "> "
                 elif btype == "to_do":              prefix = "- [x] " if data.get("checked") else "- [ ] "
                 elif btype == "callout":            prefix = "💡 "
@@ -318,7 +316,7 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
 
             elif btype == "equation":
                 expr = data.get("expression", "") or ""
-                line = f"{indent}$$ {expr} $$"
+                line = f"{indent}$$ {expr } $$"
 
             elif btype == "divider":
                 line = f"{indent}---"
@@ -500,34 +498,33 @@ def _normalize(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s.strip().lower()
 
-def _split_h2_sections(md: str) -> Dict[str, List[str]]:
+def _norm_heading_key(s: str) -> str:
+    """H2 cím egyezéshez: ékezetek törlése, lower, minden nem alfanumerikus eltávolítása."""
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = s.lower()
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+def _find_h2_positions(md: str) -> List[Tuple[int, str, str]]:
     """
-    H2 (##) címek mentén darabol, a kulcs a H2 címsor szövege (heading nélkül).
-    A tartalom NEM tartalmazza a H2 sort, csak az utána jövő sorokat a következő H2-ig.
+    Visszaadja az összes H2 címet: (sorszám a lines-ban, eredeti_cím, norm_kulcs)
+    Csak a '## ' szintet vesszük H2-nek.
     """
-    sections: Dict[str, List[str]] = {}
-    current: Optional[str] = None
-    for line in (md or "").splitlines():
+    lines = (md or "").splitlines()
+    out = []
+    for i, line in enumerate(lines):
         m = re.match(r"^\s*##\s+(.*)\s*$", line)
         if m:
             title = m.group(1).strip()
-            current = title
-            sections.setdefault(title, [])
-            continue
-        if current is not None:
-            sections[current].append(line)
-    return sections
-
-def _join(lines: List[str]) -> str:
-    return "\n".join(lines).strip()
+            out.append((i, title, _norm_heading_key(title)))
+    return out
 
 def fix_numbered_lists(md: str) -> str:
     """
     ÚJRASZÁMOZÁS:
       - csak azokat a sorokat módosítja, amelyek *szóközök után* közvetlenül „szám + . + szóköz” mintával kezdődnek.
       - figyeli a kódblokkokat (```), azokat érintetlenül hagyja.
-      - kezeli a beágyazott tartalmat: a listához tartozó, de jobban behúzott sorok (pl. a listapont alatti bekezdés)
-        nem szakítják meg a számozást.
+      - kezeli a beágyazott tartalmat: a listához tartozó, de jobban behúzott sorok nem szakítják meg a számozást.
     """
     lines = (md or "").splitlines()
     out: List[str] = []
@@ -535,15 +532,13 @@ def fix_numbered_lists(md: str) -> str:
     fence_re = re.compile(r'^\s*```')
     num_re = re.compile(r'^(\s*)(\d+)\.\s(.*)$')
 
-    active_list_indent: Optional[int] = None  # hány space a numerikus pontoknál
+    active_list_indent: Optional[int] = None
     counter_for_indent: Dict[int, int] = {}
 
     for line in lines:
-        # kódblokk nyit/zár
         if fence_re.match(line):
             in_code = not in_code
             out.append(line)
-            # kódblokk sorai ne befolyásolják a listaszámlálót
             continue
 
         if in_code:
@@ -556,61 +551,93 @@ def fix_numbered_lists(md: str) -> str:
             indent_len = len(indent_str)
             content = m.group(3)
 
-            # új lista vagy új szint?
             if active_list_indent is None or indent_len != active_list_indent:
-                # új lista ezen az indenten
-                active_list_indent = indent_len
-                # töröljük a mélyebb számlálókat
                 for k in list(counter_for_indent.keys()):
                     if k >= indent_len:
                         del counter_for_indent[k]
+                active_list_indent = indent_len
                 counter_for_indent[indent_len] = 1
             else:
-                # folytatólagos elem ugyanazon az indenten
                 counter_for_indent[indent_len] = counter_for_indent.get(indent_len, 0) + 1
 
             n = counter_for_indent[indent_len]
             out.append(f"{indent_str}{n}. {content}")
         else:
-            # nem számozott sor: eldöntjük, hogy a listán belüli tartalom-e
             if active_list_indent is not None:
                 leading_spaces = len(line) - len(line.lstrip(" "))
                 if line.strip() == "":
-                    # üres sor: listát nem szakítjuk meg
                     out.append(line)
                     continue
                 if leading_spaces > active_list_indent:
-                    # a jelenlegi listapont alatti „tartalom” → marad a lista aktív
                     out.append(line)
                     continue
-                # ide érve vagy kisebb/egyenlő indent, vagy nincs indent → vége a listának
                 active_list_indent = None
                 counter_for_indent.clear()
-
             out.append(line)
 
     return "\n".join(out)
 
+def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: List[str]) -> str:
+    """
+    A teljes markdownból kivágja a *megadott H2 címmel* kezdődő szakaszt úgy,
+    hogy CSAK a következő *stop* H2-ig vág, MÁS H2-k nem állítják meg, ha nem stop-key.
+    (Ezzel elkerüljük, hogy a szakaszon BELÜLI H2-k „félbevágják” a tartalmat.)
+    """
+    lines = (md or "").splitlines()
+    h2s = _find_h2_positions(md)
+    if not h2s:
+        return ""  # nincs H2 a dokumentumban
+
+    target_keys_n = set(_norm_heading_key(k) for k in target_keys)
+    stop_keys_n   = set(_norm_heading_key(k) for k in stop_keys)
+
+    # start: az első H2, aminek norm_kulcsa cél
+    start_idx = None
+    for (i, title, key) in h2s:
+        if key in target_keys_n:
+            start_idx = i
+            break
+    if start_idx is None:
+        return ""
+
+    # stop: a start utáni első H2, aminek norm_kulcsa stop
+    stop_idx = None
+    for (i, title, key) in h2s:
+        if i > start_idx and key in stop_keys_n:
+            stop_idx = i
+            break
+
+    # a start H2 utáni sortól a stop H2 előtti sorig
+    from_line = start_idx + 1
+    to_line = stop_idx if stop_idx is not None else len(lines)
+    chunk = "\n".join(lines[from_line:to_line]).strip()
+    return chunk
+
 def select_video_or_lesson(md: str) -> str:
     """
     Logika:
-      - Ha a „Videó szöveg” rész tartalma NEM üres → csak azt adja vissza (újraszámozva).
-      - Egyébként, ha a „Lecke szöveg” NEM üres → csak azt adja vissza (újraszámozva).
-      - Különben üres string.
+      - Ha a „Videó szöveg” szakasz NEM üres → azt adja vissza (belső H2-ket is beleértve).
+      - Egyébként, ha a „Lecke szöveg” NEM üres → azt adja vissza.
+      - Különben üres.
+    A kivágott szöveget a végén újraszámozzuk (fix_numbered_lists).
     """
-    sections = _split_h2_sections(md)
-    norm_map = { _normalize(k): k for k in sections.keys() }
+    # Olyan esetekre is jó, amikor a cím végén : vagy – szerepel, illetve extra szóközök vannak
+    video = _extract_section_by_h2(
+        md,
+        target_keys=["Videó szöveg", "Video szoveg", "Videó szöveg:", "Videó szöveg –"],
+        stop_keys=["Lecke szöveg", "Lecke szöveg:", "Megjegyzés", "Megjegyzes", "Videó szöveg", "Video szoveg"]
+    )
+    if re.search(r"\S", video):
+        return fix_numbered_lists(video)
 
-    video_key  = norm_map.get(_normalize("Videó szöveg"))
-    lesson_key = norm_map.get(_normalize("Lecke szöveg"))
+    lesson = _extract_section_by_h2(
+        md,
+        target_keys=["Lecke szöveg", "Lecke szoveg", "Lecke szöveg:", "Lecke szöveg –"],
+        stop_keys=["Videó szöveg", "Video szoveg", "Videó szöveg:", "Megjegyzés", "Megjegyzes", "Lecke szöveg", "Lecke szoveg"]
+    )
+    if re.search(r"\S", lesson):
+        return fix_numbered_lists(lesson)
 
-    video_txt  = _join(sections.get(video_key, [])) if video_key else ""
-    lesson_txt = _join(sections.get(lesson_key, [])) if lesson_key else ""
-
-    if re.search(r"\S", video_txt or ""):
-        return fix_numbered_lists(video_txt)
-    if re.search(r"\S", lesson_txt or ""):
-        return fix_numbered_lists(lesson_txt)
     return ""
 
 
@@ -624,10 +651,10 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
       - ha van dedikált 'Sorszám' property → annak értéke szerint növekvő
       - különben: cím (title) szerint ABC
     A CSV 'tartalom' mező:
-      - csak a „Videó szöveg” H2 alatti rész, HA az nem üres;
-      - különben a „Lecke szöveg” H2 alatti rész (ha nem üres);
+      - a „Videó szöveg” H2 alatti rész *egészben* (belső H2-ket is tartalmazva), ha nem üres;
+      - különben a „Lecke szöveg” H2 alatti rész *egészben*;
       - különben üres.
-      - a számozott listákat mindig 1., 2., 3. … formára újraszámozzuk (fix_numbered_lists).
+      - a számozott listákat mindig 1., 2., 3. … formára újraszámozzuk.
     A CSV 'sorszam' mező:
       - ha van 'Sorszám' property → annak értéke,
       - különben üres (nincs explicit sorszám a DB-ben).
@@ -657,7 +684,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         title = extract_title(page)
         try:
             raw_md = blocks_to_md(pid).strip()
-            content = select_video_or_lesson(raw_md)  # feltételes kivágás + újraszámozás
+            content = select_video_or_lesson(raw_md)  # feltételes kivágás (belső H2-k megőrzése) + újraszámozás
         except Exception as e:
             content = f"[HIBA: {e}]"
 
@@ -679,7 +706,7 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
 # UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a Videó szöveg (ha üres: Lecke szöveg) – a számozott listák automatikusan 1., 2., 3.… formára újraszámozva.")
+st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a teljes Videó szöveg (ha üres: Lecke szöveg) – belső H2-ket is tartalmaz, a számozott listák automatikusan újraszámozva.")
 
 # Jelszó
 if need_auth():
