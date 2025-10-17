@@ -1,17 +1,15 @@
-# app.py — Notion → Export (Kurzus) • v8 (Google Sheets realtime opcionális)
+# app.py — Notion → Export (Kurzus) • v9 (Google Sheets realtime + látható beolvasási és Sheets-haladás + Autopilot)
 # - Multiselect: "Név (db)"
 # - Login után st.rerun() → login UI eltűnik
 # - Progress bar + státusz log
-# - XLSX több munkalap + egybefűzött CSV
+# - XLSX több munkalappal + egybefűzött CSV
 # - XlsxWriter → openpyxl fallback
-# - Folytatható export: checkpoint (cache + done) Streamlit sessionben
+# - Folytatható export: checkpoint (cache + done) Streamlit sessionben + (opcionális) Google Sheets 'Resume' munkalapon
 # - Robusztus Notion retry (409/429/5xx), 403/404 skip
 # - Watchdog: AUTO_RERUN_SECONDS / MAX_GROUPS_PER_RUN / AUTO_RESUME
-# - ÚJ: Opcionális **Google Sheets** integráció (valós idejű írás)
-#   * Secrets: GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT (JSON)
-#   * 'Resume' munkalapra JSON állapot, csoportonként külön lap
-#   * Futás közben csoportonként (vagy részfutam végén) azonnali mentés Sheet-be
-#   * Resume: ha van 'Resume' lapon mentett meta és nincs session állapot, automatikusan betölti
+# - ÚJ: Beolvasási progress látható ("Adatok beolvasása…")
+# - ÚJ: Google Sheets írás haladása látható (X/Y csoport kész, utolsó lap neve)
+# - ÚJ: Autopilot (kattintás nélkül fut és folytat) — AUTO_CONTINUE, AUTO_START_MODE, query param: ?auto=1&mode=xlsx|csv
 
 from __future__ import annotations
 import os, io, re, time, math, unicodedata, json, random
@@ -21,7 +19,7 @@ from typing import Dict, List, Any, Tuple, Optional
 import streamlit as st
 import pandas as pd
 
-__VERSION__ = "v8-sheets"
+__VERSION__ = "v9-autopilot"
 
 # ----------------------------
 # Utilities
@@ -54,6 +52,7 @@ except Exception:
 DEFAULT_PROPERTY_NAME = "Kurzus"
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 
+# Opcionális átnevezések a UI-ban (egységesítés)
 DISPLAY_RENAMES: Dict[str, str] = {
     "Üzleti Modellek": "Milyen vállalkozást indíts",
     "Marketing rendszerek": "Ügyfélszerző marketing rendszerek",
@@ -75,7 +74,9 @@ RETRY_BASE = 0.7
 RETRY_FACTOR = 1.8
 RETRY_JITTER = (0.05, 0.35)
 
-# Watchdog
+# ----------------------------
+# Secrets helpers / Watchdog
+# ----------------------------
 def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     if name in os.environ and os.environ.get(name):
         return os.environ.get(name)
@@ -96,7 +97,9 @@ def _get_int_secret(name: str, default: int) -> int:
 
 AUTO_RERUN_SECONDS = _get_int_secret("AUTO_RERUN_SECONDS", 540)  # 9 perc
 MAX_GROUPS_PER_RUN = _get_int_secret("MAX_GROUPS_PER_RUN", 0)   # 0 = korlátlan
-AUTO_RESUME = _get_bool_secret("AUTO_RESUME", False)            # watchdog után automatikus folytatás
+AUTO_RESUME = _get_bool_secret("AUTO_RESUME", True)             # watchdog után automatikus folytatás
+AUTO_CONTINUE = _get_bool_secret("AUTO_CONTINUE", True)         # resume észlelésekor automatikus folytatás gombnyomás nélkül
+AUTO_START_MODE = (_get_secret("AUTO_START_MODE", "") or "").strip().lower()  # "xlsx"/"csv" => automatikus indulás új futáskor
 
 # ----------------------------
 # Streamlit client/cache
@@ -135,8 +138,19 @@ def is_sheets_enabled() -> bool:
 def get_gs_client():
     if not is_sheets_enabled():
         return None
+    raw = _get_secret("GOOGLE_SERVICE_ACCOUNT", "")
+    if not raw:
+        st.error("Google Sheets hitelesítés sikertelen: hiányzik a GOOGLE_SERVICE_ACCOUNT secret.")
+        return None
     try:
-        creds = json.loads(_get_secret("GOOGLE_SERVICE_ACCOUNT", "{}"))
+        creds = json.loads(raw)
+    except json.JSONDecodeError:
+        st.error(
+            "Google Sheets hitelesítés sikertelen: a GOOGLE_SERVICE_ACCOUNT secret nem érvényes JSON.\n"
+            "Használj TOML multiline *literal* stringet (''' ... ''') és a private_key-ben \\n escape-et."
+        )
+        return None
+    try:
         return gspread.service_account_from_dict(creds)
     except Exception as e:
         st.error(f"Google Sheets hitelesítés sikertelen: {e}")
@@ -159,7 +173,6 @@ def get_or_create_ws(sh, name: str):
     try:
         return sh.worksheet(safe)
     except Exception:
-        # create
         try:
             return sh.add_worksheet(title=safe, rows=100, cols=10)
         except Exception as e:
@@ -174,13 +187,12 @@ def ws_clear_and_header(ws, header: List[str]):
         st.error(f"Worksheet tisztítás/fejléc hiba ({ws.title}): {e}")
 
 def ws_append_rows(ws, rows: List[List[str]]):
-    # Append in batches to reduce API calls
     CHUNK = 200
     for i in range(0, len(rows), CHUNK):
         batch = rows[i:i+CHUNK]
         for attempt in range(1, 5):
             try:
-                ws.append_rows(batch, value_input_option="RAW", table_range=f"A1")
+                ws.append_rows(batch, value_input_option="RAW", table_range="A1")
                 break
             except Exception as e:
                 time.sleep(0.7 * attempt)
@@ -512,7 +524,7 @@ def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: Optional[
     norm_t = [normalize(x) for x in target_keys]
     norm_stop = [normalize(x) for x in stop_keys]
     target_idx = None
-    for i, (pos, title) in enumerate(h2s):
+    for i, (_, title) in enumerate(h2s):
         if normalize(title) in norm_t:
             target_idx = i
             break
@@ -606,12 +618,18 @@ def extract_property_as_string(page: Dict[str, Any], prop_name: Optional[str]) -
 # ----------------------------
 # Group index + rows
 # ----------------------------
-def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: str, prop_meta: Dict[str, Any]) -> Tuple[List[Tuple[str,int,set]], Dict[str, Dict[str, Any]]]:
+def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: str, prop_meta: Dict[str, Any],
+                        on_progress=None) -> Tuple[List[Tuple[str,int,set]], Dict[str, Dict[str, Any]]]:
+    """Beolvasás látható haladással: on_progress(batch_no, total_pages_so_far)"""
     id_to_opt = property_options_map(prop_meta)
     counts_by_id = {oid: 0 for oid in id_to_opt.keys()}
     seen_names_by_id = {oid: set() for oid in id_to_opt.keys()}
 
-    pages = list_all_pages(client, dbid)
+    pages = list_all_pages(
+        client, dbid,
+        on_batch=(lambda b, n: on_progress(b, n) if callable(on_progress) else None)
+    )
+
     for pg in pages:
         p = pg.get("properties", {}).get(prop_name)
         if not p:
@@ -619,30 +637,24 @@ def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: st
         if prop_type == "select":
             sel = p.get("select")
             if sel:
-                oid = sel.get("id")
-                nm = sel.get("name","")
+                oid = sel.get("id"); nm = sel.get("name","")
                 if oid in counts_by_id:
                     counts_by_id[oid] += 1
-                    if nm:
-                        seen_names_by_id[oid].add(nm)
+                    if nm: seen_names_by_id[oid].add(nm)
         elif prop_type == "multi_select":
             arr = p.get("multi_select", [])
             for sel in arr:
-                oid = sel.get("id")
-                nm = sel.get("name","")
+                oid = sel.get("id"); nm = sel.get("name","")
                 if oid in counts_by_id:
                     counts_by_id[oid] += 1
-                    if nm:
-                        seen_names_by_id[oid].add(nm)
+                    if nm: seen_names_by_id[oid].add(nm)
         elif prop_type == "status":
             stt = p.get("status")
             if stt:
-                oid = stt.get("id")
-                nm = stt.get("name","")
+                oid = stt.get("id"); nm = stt.get("name","")
                 if oid in counts_by_id:
                     counts_by_id[oid] += 1
-                    if nm:
-                        seen_names_by_id[oid].add(nm)
+                    if nm: seen_names_by_id[oid].add(nm)
 
     display_to_canon: Dict[str, Dict[str, Any]] = {}
     items: List[Tuple[str,int,set]] = []
@@ -748,7 +760,7 @@ def sanitize_sheet_name(name: str) -> str:
 # ----------------------------
 def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: str):
     st.session_state["resume"] = {
-        "version": 6,
+        "version": 7,
         "mode": mode,
         "property_name": property_name,
         "dbid": dbid,
@@ -757,7 +769,6 @@ def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: 
         "cache": {},
         "created_at": datetime.utcnow().isoformat()+"Z",
     }
-    # Persist to Sheets (if enabled)
     if is_sheets_enabled():
         sh = get_spreadsheet()
         if sh:
@@ -801,7 +812,6 @@ def _sheets_write_group(display_name: str, rows: List[Dict[str,str]]):
     if not ws:
         return
     ws_clear_and_header(ws, CSV_FIELDNAMES)
-    # map rows -> lists
     values = [[r.get("oldal_cime",""), r.get("szakasz",""), r.get("sorszam",""), r.get("tartalom","")] for r in rows]
     ws_append_rows(ws, values)
 
@@ -851,11 +861,18 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
 
-    bar = st.progress(0)
+    bar = st.progress(0, text="XLSX export folyamatban…")
+    sheets_bar = st.progress(0, text="Google Sheets írás…")
     log = st.empty()
     total_steps = max(1, len(remaining))
-    processed = 0
+    total_groups = len(groups)
+    processed = len(done)  # már kész csoportok
     start_ts = time.time()
+
+    if total_groups > 0:
+        sheets_bar.progress(int(len(done) * 100 / total_groups), text=f"Google Sheets: {len(done)}/{total_groups} lap kész.")
+    else:
+        sheets_bar.progress(0, text="Google Sheets: 0/0 lap.")
 
     for display_name in remaining:
         log.write(f"„{display_name}” feldolgozása…")
@@ -870,29 +887,31 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
             if rows:
                 break
         _cache_put(meta, display_name, rows)
-        # Sheets-be azonnali mentés (csoport kész)
+
         _sheets_write_group(display_name, rows)
         meta["done"].append(display_name)
         _sheets_update_resume()
-
         processed += 1
-        pct = int(processed * 100 / total_steps)
-        bar.progress(pct)
-        log.write(f"{pct}% – {display_name}: {len(rows)} sor.")
+        pct = int(processed * 100 / total_groups) if total_groups else 100
+        sheets_bar.progress(pct, text=f"Google Sheets: {processed}/{total_groups} lap kész. Utolsó: {sanitize_sheet_name(display_name)}")
 
-        if MAX_GROUPS_PER_RUN and processed >= MAX_GROUPS_PER_RUN:
+        pct_rem = int((len(meta["done"]) - (total_groups - total_steps)) * 100 / total_steps) if total_steps else 100
+        bar.progress(min(max(pct_rem, 0), 100), text=f"XLSX export: {pct_rem}% – {display_name}: {len(rows)} sor.")
+
+        if MAX_GROUPS_PER_RUN and (len(meta["done"]) % MAX_GROUPS_PER_RUN == 0):
             log.write("Részfutam limit elérve – automatikus folytatás…")
             if AUTO_RESUME:
                 st.session_state["auto_resume_pending"] = True
+            _sheets_update_resume()
             st.rerun()
 
         if AUTO_RERUN_SECONDS and (time.time() - start_ts) >= AUTO_RERUN_SECONDS:
             log.write("Időkeret elérve – automatikus folytatás…")
             if AUTO_RESUME:
                 st.session_state["auto_resume_pending"] = True
+            _sheets_update_resume()
             st.rerun()
 
-    # Lokális XLSX az összes csoportból (cache)
     output = io.BytesIO()
     with _excel_writer(output) as writer:
         for display_name in groups:
@@ -908,7 +927,6 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     output.seek(0)
     st.success("XLSX elkészült.")
     st.session_state.pop("resume", None)
-    # Végállapot kiírása is megmarad a Resume lapon az utolsó mentéssel
     return output.read()
 
 def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
@@ -923,11 +941,18 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
 
-    bar = st.progress(0)
+    bar = st.progress(0, text="CSV export folyamatban…")
+    sheets_bar = st.progress(0, text="Google Sheets írás…")
     log = st.empty()
     total_steps = max(1, len(remaining))
-    processed = 0
+    total_groups = len(groups)
+    processed = len(done)
     start_ts = time.time()
+
+    if total_groups > 0:
+        sheets_bar.progress(int(len(done) * 100 / total_groups), text=f"Google Sheets: {len(done)}/{total_groups} lap kész.")
+    else:
+        sheets_bar.progress(0, text="Google Sheets: 0/0 lap.")
 
     for display_name in remaining:
         log.write(f"„{display_name}” feldolgozása…")
@@ -942,28 +967,31 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
             if rows:
                 break
         _cache_put(meta, display_name, rows)
+
         _sheets_write_group(display_name, rows)
         meta["done"].append(display_name)
         _sheets_update_resume()
-
         processed += 1
-        pct = int(processed * 100 / total_steps)
-        bar.progress(pct)
-        log.write(f"{pct}% – {display_name}: {len(rows)} sor.")
+        pct = int(processed * 100 / total_groups) if total_groups else 100
+        sheets_bar.progress(pct, text=f"Google Sheets: {processed}/{total_groups} lap kész. Utolsó: {sanitize_sheet_name(display_name)}")
 
-        if MAX_GROUPS_PER_RUN and processed >= MAX_GROUPS_PER_RUN:
+        pct_rem = int((len(meta["done"]) - (total_groups - total_steps)) * 100 / total_steps) if total_steps else 100
+        bar.progress(min(max(pct_rem, 0), 100), text=f"CSV export: {pct_rem}% – {display_name}: {len(rows)} sor.")
+
+        if MAX_GROUPS_PER_RUN and (len(meta["done"]) % MAX_GROUPS_PER_RUN == 0):
             log.write("Részfutam limit elérve – automatikus folytatás…")
             if AUTO_RESUME:
                 st.session_state["auto_resume_pending"] = True
+            _sheets_update_resume()
             st.rerun()
 
         if AUTO_RERUN_SECONDS and (time.time() - start_ts) >= AUTO_RERUN_SECONDS:
             log.write("Időkeret elérve – automatikus folytatás…")
             if AUTO_RESUME:
                 st.session_state["auto_resume_pending"] = True
+            _sheets_update_resume()
             st.rerun()
 
-    # Egybefűzött CSV (cache-ből)
     all_rows: List[Dict[str,str]] = []
     for display_name in groups:
         rows = meta["cache"].get(display_name, {}).get("rows", [])
@@ -977,7 +1005,7 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
     return buf.getvalue().encode("utf-8-sig")
 
 # ----------------------------
-# UI + login
+# UI + login + Autopilot
 # ----------------------------
 def require_login():
     app_pw = _get_secret("APP_PASSWORD")
@@ -997,6 +1025,46 @@ def require_login():
         else:
             st.error("Hibás jelszó.")
     st.stop()
+
+def maybe_autopilot(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts, groups_sorted):
+    """Kattintás nélküli futtatás/folytatás:
+       - Ha van resume és AUTO_CONTINUE: azonnal folytat.
+       - Ha nincs resume, de AUTO_START_MODE / ?auto=1 & mode=…: elindítja és futtatja.
+    """
+    try:
+        params = st.query_params
+    except Exception:
+        params = {}
+    qp_auto = str(params.get("auto", ["0"])[0] if isinstance(params.get("auto"), list) else params.get("auto", "0")).lower()
+    qp_mode = str(params.get("mode", [""])[0] if isinstance(params.get("mode"), list) else params.get("mode", "")).lower()
+
+    resume_meta = get_resume()
+    if resume_meta and AUTO_CONTINUE:
+        st.info("🔁 Autopilot: folyamat folytatása…")
+        if resume_meta.get("mode") == "xlsx":
+            data = resumable_xlsx(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts)
+            st.download_button("📥 összes_kurzus.xlsx", data=data, file_name="osszes_kurzus.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        else:
+            data = resumable_csv(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts)
+            st.download_button("📥 osszes_kurzus.csv", data=data, file_name="osszes_kurzus.csv", mime="text/csv", use_container_width=True)
+        return True
+
+    want_auto = (AUTO_START_MODE in ("xlsx","csv")) or (qp_auto in ("1","true","yes","on"))
+    if not want_auto:
+        return False
+
+    mode = qp_mode if qp_mode in ("xlsx","csv") else (AUTO_START_MODE if AUTO_START_MODE in ("xlsx","csv") else "xlsx")
+    groups_display = [name for (name,_,_) in groups_sorted]
+    st.session_state.pop("resume", None)
+    init_resume(mode, groups_display, group_prop_name, dbid)
+    st.info(f"🚀 Autopilot: automatikus indítás ({mode.upper()})…")
+    if mode == "xlsx":
+        data = resumable_xlsx(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts)
+        st.download_button("📥 összes_kurzus.xlsx", data=data, file_name="osszes_kurzus.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    else:
+        data = resumable_csv(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts)
+        st.download_button("📥 osszes_kurzus.csv", data=data, file_name="osszes_kurzus.csv", mime="text/csv", use_container_width=True)
+    return True
 
 def main():
     st.set_page_config(page_title="Notion → Export (Kurzus)", page_icon="📦", layout="wide")
@@ -1033,16 +1101,36 @@ def main():
 **Rendezés**: {"Sorszám ↑" if order_prop else "Cím ↑"}
             """
         )
-        st.caption(f"⏱️ Watchdog: AUTO_RERUN_SECONDS={AUTO_RERUN_SECONDS}, MAX_GROUPS_PER_RUN={MAX_GROUPS_PER_RUN}, AUTO_RESUME={AUTO_RESUME}")
+        st.caption(f"⏱️ Watchdog: AUTO_RERUN_SECONDS={AUTO_RERUN_SECONDS}, MAX_GROUPS_PER_RUN={MAX_GROUPS_PER_RUN}, AUTO_RESUME={AUTO_RESUME}, AUTO_CONTINUE={AUTO_CONTINUE}, AUTO_START_MODE={AUTO_START_MODE or '—'}")
 
     # Ha van Sheets-ben Resume és nincs session resume, töltsük be
     maybe_load_resume_from_sheets(dbid, group_prop_name)
 
-    st.write("Adatok beolvasása…")
-    groups_sorted, display_to_canon = collect_group_index(client, dbid, group_prop_name, group_prop_type, group_prop_meta)
+    # Látható beolvasási progress ("Adatok beolvasása…")
+    scan_status = st.empty()
+    scan_bar = st.progress(0, text="Adatok beolvasása (Notion DB) …")
+
+    def show_scan_progress(batch_no, total_sofar):
+        txt = f"Adatok beolvasása… összesen {total_sofar} oldal (batch {batch_no})."
+        scan_status.info(txt)
+        scan_bar.progress((batch_no * 7) % 100, text=txt)
+
+    groups_sorted, display_to_canon = collect_group_index(
+        client, dbid, group_prop_name, group_prop_type, group_prop_meta,
+        on_progress=show_scan_progress
+    )
+
+    total_pages_counted = sum(cnt for _, cnt, _ in groups_sorted)
+    scan_bar.progress(100, text=f"Kész: {len(groups_sorted)} csoportérték, összesen ~{total_pages_counted} oldal.")
+    scan_status.success(f"Kész: {len(groups_sorted)} csoportérték, ~{total_pages_counted} oldal.")
+
     if not groups_sorted:
         st.info("Nem találtam csoportokat/értékeket.")
         st.stop()
+
+    # === Autopilot: ha kell, induljon / folytasson gombnyomás nélkül ===
+    if maybe_autopilot(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts, groups_sorted):
+        st.divider()
 
     st.subheader("Csoportok (db szerint csökkenő)")
     labels = [f"{name} ({cnt})" for (name, cnt, _) in groups_sorted]
@@ -1137,7 +1225,7 @@ def main():
         colr1, colr2, colr3 = st.columns([1,1,1])
         with colr1:
             auto_restart = st.session_state.pop("auto_resume_pending", False)
-            if st.button("▶️ Folytatás most") or auto_restart:
+            if st.button("▶️ Folytatás most") or (auto_restart and AUTO_CONTINUE):
                 if resume_meta.get("mode") == "xlsx":
                     data = resumable_xlsx(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts)
                     st.download_button("📥 összes_kurzus.xlsx", data=data, file_name="osszes_kurzus.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
