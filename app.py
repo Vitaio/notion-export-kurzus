@@ -1,6 +1,8 @@
 # app.py
-# Streamlit + Notion export (resumable with cache, robust retries, tolerant to 403/404, progress, counts, disappearing login)
+# Streamlit + Notion export (resumable, robust retries, tolerant to 403/404, progress, counts)
+# + Watchdog: auto-rerun after time/chunk to avoid platform timeouts (configurable via secrets)
 # Env/Secrets: NOTION_API_KEY, NOTION_DATABASE_ID, APP_PASSWORD, NOTION_PROPERTY_NAME (default: "Kurzus")
+#              AUTO_RERUN_SECONDS (default: 540), MAX_GROUPS_PER_RUN (default: 0=unlimited), AUTO_RESUME (true/false)
 
 import os, io, re, time, math, unicodedata, json, random
 from datetime import datetime
@@ -21,6 +23,9 @@ except Exception:
 from notion_client import Client
 from notion_client.errors import APIResponseError, HTTPResponseError
 
+# ----------------------------
+# UI helpers
+# ----------------------------
 class ProgressReporter:
     def __init__(self, total_steps: int, title: str):
         self.total = max(1, int(total_steps))
@@ -61,6 +66,9 @@ class ProgressReporter:
                 except Exception:
                     pass
 
+# ----------------------------
+# Config / constants
+# ----------------------------
 DEFAULT_PROPERTY_NAME = "Kurzus"
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 
@@ -78,12 +86,16 @@ LESSON_SECTION_KEYS = [
     "lecke tartalom", "lesson text"
 ]
 
+# Retry config
 RETRYABLE_STATUS = {409, 429, 500, 502, 503, 504}
 RETRY_MAX = 7
 RETRY_BASE = 0.7
 RETRY_FACTOR = 1.8
 RETRY_JITTER = (0.05, 0.35)
 
+# ----------------------------
+# Secrets/env
+# ----------------------------
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     if name in os.environ and os.environ.get(name):
         return os.environ.get(name)
@@ -92,6 +104,23 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     except Exception:
         return default
 
+def get_bool_secret(name: str, default: bool = False) -> bool:
+    val = str(get_secret(name, str(default))).strip().lower()
+    return val in ("1","true","yes","on")
+
+def get_int_secret(name: str, default: int) -> int:
+    try:
+        return int(get_secret(name, str(default)))
+    except Exception:
+        return default
+
+AUTO_RERUN_SECONDS = get_int_secret("AUTO_RERUN_SECONDS", 540)  # 9 perc
+MAX_GROUPS_PER_RUN = get_int_secret("MAX_GROUPS_PER_RUN", 0)   # 0 = korlátlan
+AUTO_RESUME = get_bool_secret("AUTO_RESUME", False)            # automatikus folytatás rerun után
+
+# ----------------------------
+# Caching / clients
+# ----------------------------
 @st.cache_resource
 def get_notion_client() -> Client:
     token = get_secret("NOTION_API_KEY")
@@ -117,7 +146,11 @@ def get_db_schema(dbid: str) -> Dict[str, Any]:
     client = get_notion_client()
     return client.databases.retrieve(database_id=dbid)
 
+# ----------------------------
+# Notion helpers (robust layer)
+# ----------------------------
 def _retry_sleep(e: Optional[HTTPResponseError], attempt: int):
+    # Retry-After header first
     if e is not None and getattr(e, "response", None) is not None:
         try:
             hdr = e.response.headers.get("Retry-After")
@@ -143,6 +176,7 @@ def notion_request(callable_fn, *, retry_label: str = ""):
                     st.write(f"⏳ Újrapróbálkozás ({attempt}/{RETRY_MAX}) – {retry_label} [HTTP {status}]")
                 _retry_sleep(e, attempt)
                 continue
+            # Non-retryable -> propagate (403/404, stb.)
             raise
         except APIResponseError as e:
             last_err = e
@@ -237,8 +271,10 @@ def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None, on_ba
             payload["sorts"] = sorts
         if cursor:
             payload["start_cursor"] = cursor
+
         def _q():
             return client.databases.query(database_id=dbid, **payload)
+
         resp = notion_request(_q, retry_label="databases.query")
         chunk = resp.get("results", [])
         pages.extend(chunk)
@@ -254,6 +290,7 @@ def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None, on_ba
             break
     return pages
 
+# Blocks -> Markdown with robust fetching
 def fetch_blocks(client: Client, block_id: str) -> List[Dict[str, Any]]:
     results = []
     cursor = None
@@ -267,6 +304,7 @@ def fetch_blocks(client: Client, block_id: str) -> List[Dict[str, Any]]:
         except HTTPResponseError as e:
             status = getattr(e, "status", None)
             if status in (403, 404):
+                # nincs jogosultság / törölt – térjünk vissza az addig gyűjtötttel
                 return results
             raise
         results.extend(resp.get("results", []))
@@ -308,11 +346,13 @@ def fix_numbered_lists(md: str) -> str:
     out = []
     in_code = False
     counters = {}
+
     def is_num_item(s: str) -> Optional[int]:
         m = re.match(r"^(\s*)(\d+)\.\s", s)
         if m:
             return len(m.group(1))
         return None
+
     for line in lines:
         if line.strip().startswith("```"):
             in_code = not in_code
@@ -321,10 +361,12 @@ def fix_numbered_lists(md: str) -> str:
         if in_code:
             out.append(line)
             continue
+
         indent = is_num_item(line)
         if indent is None:
             out.append(line)
             continue
+
         to_del = [k for k in list(counters.keys()) if k > indent]
         for k in to_del:
             counters.pop(k, None)
@@ -332,6 +374,7 @@ def fix_numbered_lists(md: str) -> str:
             counters[indent] = 1
         else:
             counters[indent] += 1
+
         new_idx = counters[indent]
         line = re.sub(r"^(\s*)\d+\.\s", r"\g<1>" + f"{new_idx}. ", line)
         out.append(line)
@@ -341,6 +384,7 @@ def blocks_to_md(blocks: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     def emit(s: str=""):
         lines.append(s)
+
     def walk(block, indent=0):
         t = block.get("type")
         b = block.get(t, {})
@@ -377,14 +421,17 @@ def blocks_to_md(blocks: List[Dict[str, Any]]) -> str:
             if ex:
                 emit(f"$$ {ex} $$")
         elif t in ("image","video","file","pdf"):
-            cap = rich_text_to_md(b.get("caption", [])) if b.get("caption") else ""
+            cap = b.get("caption")
+            cap = rich_text_to_md(cap) if isinstance(cap, list) else ""
             emit(f"*[{t.upper()}]* {cap}".rstrip())
         elif t in ("table","table_row"):
             emit(f"*[{t.upper()}]*")
         else:
             emit(f"*[{t.upper()}]*")
+
     for bl in blocks:
         walk(bl, indent=0)
+
     md = "\n".join(lines)
     md = re.sub(r"\n{3,}", "\n\n", md)
     md = fix_numbered_lists(md)
@@ -520,6 +567,7 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
         oldal_cime = extract_title(pg, title_prop) if title_prop else ""
         szakasz = extract_property_as_string(pg, section_prop) if section_prop else ""
         sorszam = extract_property_as_string(pg, order_prop) if order_prop else ""
+        # Robust block fetch
         try:
             blocks = fetch_blocks_recursive(client, pg["id"])
             md = blocks_to_md(blocks)
@@ -529,7 +577,7 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
             if code in (403, 404):
                 if callable(on_progress):
                     on_progress(f"⚠️ Kihagyva: nincs jogosultság vagy törölt oldal (HTTP {code}) – {oldal_cime}")
-                tartalom = ""
+                tartalom = ""  # continue without content
             else:
                 raise
         rows.append({
@@ -549,6 +597,7 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
         rows.sort(key=lambda r: r["oldal_cime"].lower())
     return rows
 
+# Excel writer fallback
 def _excel_writer(output_io):
     try:
         import xlsxwriter  # noqa: F401
@@ -565,15 +614,18 @@ def sanitize_sheet_name(name: str) -> str:
     name = re.sub(r'[:\\/?*\\[\\]]', "_", name)
     return name[:31] if len(name) > 31 else name
 
+# ----------------------------
+# Resumable export (with cached results) + WATCHDOG
+# ----------------------------
 def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: str):
     st.session_state["resume"] = {
-        "version": 3,
+        "version": 4,
         "mode": mode,
         "property_name": property_name,
         "dbid": dbid,
         "groups": groups_display,
         "done": [],
-        "cache": {},
+        "cache": {},  # display_name -> {"rows": [...], "count": int, "ts": ...}
         "created_at": datetime.utcnow().isoformat()+"Z",
     }
 
@@ -616,6 +668,19 @@ def checkpoint_uploader(label="🔁 Checkpoint betöltése"):
         except Exception as e:
             st.error(f"Nem sikerült betölteni: {e}")
 
+def _watchdog_should_rerun(start_ts: float, processed: int) -> bool:
+    if MAX_GROUPS_PER_RUN and processed >= MAX_GROUPS_PER_RUN:
+        return True
+    if AUTO_RERUN_SECONDS and (time.time() - start_ts) >= AUTO_RERUN_SECONDS:
+        return True
+    return False
+
+def _trigger_auto_rerun():
+    if AUTO_RESUME:
+        st.session_state["auto_resume_pending"] = True
+    st.toast("⌛ Időkeret/kvóta elérés – automatikus folytatás…", icon="⏳")
+    st.rerun()
+
 def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                    display_to_canon: Dict[str, Dict[str, Any]], title_prop: str,
                    section_prop: Optional[str], order_prop: Optional[str],
@@ -627,7 +692,12 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     groups = meta["groups"]
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
+
     reporter = ProgressReporter(total_steps=len(remaining), title="XLSX export folyamatban… (folytatható)")
+    start_ts = time.time()
+    processed = 0
+
+    # 1) Csak a fennmaradó csoportokat dolgozzuk fel és töltjük a cache-be
     for display_name in remaining:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
@@ -641,7 +711,15 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                 break
         _cache_put(meta, display_name, rows)
         meta["done"].append(display_name)
+        processed += 1
         reporter.tick(f"{display_name} – {len(rows)} sor kész.")
+
+        # Watchdog: limit per run
+        if _watchdog_should_rerun(start_ts, processed):
+            reporter.finish(ok=True, msg="Részfutam mentve, folytatás…")
+            _trigger_auto_rerun()
+
+    # 2) Kimenet összeállítása: MINDEN csoport a cache-ből
     output = io.BytesIO()
     with _excel_writer(output) as writer:
         for display_name in groups:
@@ -653,6 +731,7 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                 i += 1
                 sheet = sanitize_sheet_name(f"{base}_{i}")
             df.to_excel(writer, index=False, sheet_name=sheet)
+
     output.seek(0)
     reporter.finish(ok=True, msg="XLSX elkészült.")
     st.session_state.pop("resume", None)
@@ -669,7 +748,12 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
     groups = meta["groups"]
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
+
     reporter = ProgressReporter(total_steps=len(remaining), title="CSV (egybefűzött) export folyamatban… (folytatható)")
+    start_ts = time.time()
+    processed = 0
+
+    # 1) Feldolgozzuk a maradék csoportokat és cache-eljük
     for display_name in remaining:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
@@ -683,18 +767,30 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
                 break
         _cache_put(meta, display_name, rows)
         meta["done"].append(display_name)
+        processed += 1
         reporter.tick(f"{display_name} – {len(rows)} sor hozzáadva.")
+
+        # Watchdog: limit per run
+        if _watchdog_should_rerun(start_ts, processed):
+            reporter.finish(ok=True, msg="Részfutam mentve, folytatás…")
+            _trigger_auto_rerun()
+
+    # 2) Összefűzés: a cache-ben levő összes csoport adata
     all_rows: List[Dict[str,str]] = []
     for display_name in groups:
         rows = meta["cache"].get(display_name, {}).get("rows", [])
         for r in rows:
             r2 = dict(r); r2["csoport"] = display_name; all_rows.append(r2)
+
     buf = io.StringIO()
     pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
     reporter.finish(ok=True, msg="CSV elkészült.")
     st.session_state.pop("resume", None)
     return buf.getvalue().encode("utf-8-sig")
 
+# ----------------------------
+# UI + login
+# ----------------------------
 def require_login():
     app_pw = get_secret("APP_PASSWORD")
     if not app_pw:
@@ -717,17 +813,22 @@ def require_login():
 def main():
     st.set_page_config(page_title="Notion → Export (Kurzus)", page_icon="📦", layout="wide")
     st.title("📦 Notion → Export (Kurzus)")
-    st.caption("Notion adatbázisból exportálás csoportok szerint • Beállítás: `NOTION_PROPERTY_NAME` (alap: „Kurzus”).")
+    st.caption("Notion adatbázisból exportálás csoportok szerint • `NOTION_PROPERTY_NAME` (alap: „Kurzus”).")
+
     require_login()
+
     client = get_notion_client()
     dbid = get_database_id()
     schema = get_db_schema(dbid)
+
     PROPERTY_NAME = get_property_name()
     group_prop_name, group_prop_type, group_prop_meta = find_group_property(schema, PROPERTY_NAME)
+
     title_prop = detect_title_prop(schema)
     section_prop = best_effort_section_prop(schema)
     order_prop = best_effort_order_prop(schema)
     sorts = resolve_sorts(order_prop, title_prop)
+
     with st.expander("ℹ️ Használt mezők és rendezés", expanded=False):
         st.markdown(
             f"""
@@ -738,27 +839,33 @@ def main():
 **Rendezés**: {"Sorszám ↑" if order_prop else "Cím ↑"}
             """
         )
+        st.caption(f"⏱️ Watchdog: AUTO_RERUN_SECONDS={AUTO_RERUN_SECONDS}, MAX_GROUPS_PER_RUN={MAX_GROUPS_PER_RUN}, AUTO_RESUME={AUTO_RESUME}")
+
     st.write("Adatok beolvasása…")
     groups_sorted, display_to_canon = collect_group_index(client, dbid, group_prop_name, group_prop_type, group_prop_meta)
     if not groups_sorted:
         st.info("Nem találtam csoportokat/értékeket.")
         st.stop()
+
     st.subheader("Csoportok (db szerint csökkenő)")
     labels = [f"{name} ({cnt})" for (name, cnt, _) in groups_sorted]
     label_to_name = {f"{name} ({cnt})": name for (name, cnt, _) in groups_sorted}
+
     selected_labels = st.multiselect(
         "Válaszd ki, melyeket szeretnéd külön CSV-ként is:",
         options=labels,
         default=[],
         placeholder="(nem kötelező)"
     )
+
     st.divider()
     col1, col2, col3 = st.columns([1,1,1])
+
     with col1:
         st.markdown("#### Összes egy fájlban – Excel (több munkalap)")
         if st.button("⬇️ Letöltés (XLSX)"):
             groups_display = [name for (name,_,_) in groups_sorted]
-            st.session_state.pop("resume", None)
+            st.session_state.pop("resume", None)  # új futam kezdete
             init_resume("xlsx", groups_display, group_prop_name, dbid)
             data = resumable_xlsx(
                 client, dbid, group_prop_name, group_prop_type,
@@ -772,6 +879,7 @@ def main():
                 use_container_width=True
             )
             checkpoint_download_button("💾 Checkpoint letöltése (XLSX)")
+
     with col2:
         st.markdown("#### Összes egy fájlban – CSV (egybefűzve)")
         if st.button("⬇️ Letöltés (CSV)"):
@@ -790,6 +898,7 @@ def main():
                 use_container_width=True
             )
             checkpoint_download_button("💾 Checkpoint letöltése (CSV)")
+
     with col3:
         st.markdown("#### Kiválasztott csoportok – külön CSV-k")
         if not selected_labels:
@@ -820,6 +929,7 @@ def main():
             )
             if last_msg:
                 st.caption(last_msg)
+
     st.divider()
     st.markdown("### 🔁 Megszakadt export folytatása")
     resume_meta = get_resume()
@@ -829,7 +939,8 @@ def main():
         st.info(f"Mentett állapot: **{resume_meta.get('mode').upper()}**, kész: {done}/{total}")
         colr1, colr2, colr3 = st.columns([1,1,1])
         with colr1:
-            if st.button("▶️ Folytatás most"):
+            auto_restart = st.session_state.pop("auto_resume_pending", False)
+            if st.button("▶️ Folytatás most") or auto_restart:
                 if resume_meta.get("mode") == "xlsx":
                     data = resumable_xlsx(client, dbid, group_prop_name, group_prop_type, display_to_canon, title_prop, section_prop, order_prop, sorts)
                     st.download_button("📥 összes_kurzus.xlsx", data=data, file_name="osszes_kurzus.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
@@ -844,7 +955,9 @@ def main():
                 st.success("Mentés törölve.")
     else:
         checkpoint_uploader("🔁 Checkpoint betöltése (JSON)")
+
     st.caption("© Notion → Export • Streamlit app")
+    st.caption("Watchdog opciók: AUTO_RERUN_SECONDS, MAX_GROUPS_PER_RUN, AUTO_RESUME")
 
 if __name__ == "__main__":
     main()
