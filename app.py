@@ -13,7 +13,6 @@ import io
 import re
 import time
 import math
-import json
 import unicodedata
 from typing import Dict, List, Any, Tuple, Optional
 
@@ -76,6 +75,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 def get_notion_client() -> Client:
     token = get_secret("NOTION_API_KEY")
     if not token:
+        st.error("Hiányzik a NOTION_API_KEY.")
         st.stop()
     return Client(auth=token)
 
@@ -91,8 +91,10 @@ def get_database_id() -> str:
         st.stop()
     return dbid
 
+# ⬇️ FIX: ne adjunk át Client-et cache-elt függvénynek
 @st.cache_data(ttl=120)
-def get_db_schema(client: Client, dbid: str) -> Dict[str, Any]:
+def get_db_schema(dbid: str) -> Dict[str, Any]:
+    client = get_notion_client()
     return client.databases.retrieve(database_id=dbid)
 
 # ----------------------------
@@ -108,7 +110,6 @@ def backoff_retry(fn, max_tries=5, base=0.5, factor=2.0, **kwargs):
             attempt += 1
             if attempt >= max_tries:
                 raise
-            # 429, 5xx
             sleep_s = base * (factor ** (attempt - 1)) + (0.01 * (attempt % 7))
             time.sleep(sleep_s)
 
@@ -136,14 +137,11 @@ def all_properties(schema: Dict[str, Any]) -> Dict[str, Any]:
     return schema.get("properties", {})
 
 def best_effort_section_prop(schema: Dict[str, Any]) -> Optional[str]:
-    # keresési kulcsok
     candidates = {"szakasz","szekcio","section","modul","fejezet","resz","rész","chapter"}
     props = all_properties(schema)
-    # 1) név szerinti találat
     for name in props:
         if normalize(name) in candidates:
             return name
-    # 2) típus szerinti fallback: select/multi_select/status
     for name, meta in props.items():
         if meta.get("type") in ("select","multi_select","status"):
             return name
@@ -162,7 +160,6 @@ def best_effort_order_prop(schema: Dict[str, Any]) -> Optional[str]:
 
 def find_group_property(schema: Dict[str, Any], wanted: str) -> Tuple[str, str, Dict[str, Any]]:
     props = all_properties(schema)
-    # pontos név, majd case/ékezet független
     if wanted in props:
         p = props[wanted]
         return wanted, p.get("type"), p
@@ -174,7 +171,6 @@ def find_group_property(schema: Dict[str, Any], wanted: str) -> Tuple[str, str, 
     st.stop()
 
 def property_options_map(prop_meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    # id -> {"name": str}
     ptype = prop_meta.get("type")
     m: Dict[str, Dict[str, Any]] = {}
     if ptype in ("select","multi_select"):
@@ -265,7 +261,7 @@ def extract_property_as_string(page: Dict[str, Any], prop_name: Optional[str]) -
                 if em:
                     names.append(em)
         return ", ".join(names)
-    if t == "title":  # fallback
+    if t == "title":
         arr = p.get("title", [])
         return "".join(rt.get("plain_text","") for rt in arr)
     return ""
@@ -312,79 +308,7 @@ def rich_text_to_md(rt: List[Dict[str, Any]]) -> str:
         s += text
     return s
 
-def blocks_to_md(blocks: List[Dict[str, Any]]) -> str:
-    lines: List[str] = []
-
-    def emit(s: str=""):
-        lines.append(s)
-
-    def walk(block, indent=0):
-        t = block.get("type")
-        b = block.get(t, {})
-        prefix = " " * indent
-
-        if t in ("paragraph","quote","callout","to_do","toggle","bulleted_list_item","numbered_list_item"):
-            content = rich_text_to_md(b.get("rich_text", []))
-            if t == "paragraph":
-                if content.strip():
-                    emit(prefix + content)
-                else:
-                    emit("")  # üres sor
-            elif t == "quote":
-                emit(prefix + "> " + content)
-            elif t == "callout":
-                emoji = b.get("icon", {}).get("emoji") if isinstance(b.get("icon"), dict) else ""
-                emit(prefix + f"> {emoji or '💡'} {content}")
-            elif t == "to_do":
-                ck = "[x]" if b.get("checked") else "[ ]"
-                emit(prefix + f"- {ck} {content}")
-            elif t == "bulleted_list_item":
-                emit(prefix + f"- {content}")
-            elif t == "numbered_list_item":
-                # direkt 1.-gyel írjuk, később újraszámozunk
-                emit(prefix + f"1. {content}")
-            # gyerekek
-            for c in block.get("_children", []):
-                walk(c, indent=indent+2)
-
-        elif t in ("heading_1","heading_2","heading_3"):
-            level = {"heading_1": "#", "heading_2": "##", "heading_3": "###"}[t]
-            content = rich_text_to_md(b.get("rich_text", []))
-            emit(f"{level} {content}")
-
-        elif t in ("divider",):
-            emit("\n---\n")
-
-        elif t in ("equation",):
-            ex = b.get("expression","")
-            if ex:
-                emit(f"$$ {ex} $$")
-
-        elif t in ("image","video","file","pdf"):
-            cap = rich_text_to_md(b.get("caption", [])) if b.get("caption") else ""
-            emit(f"*[{t.upper()}]* {cap}".rstrip())
-
-        elif t in ("table","table_row"):
-            # egyszerűsítve jelöljük
-            emit(f"*[{t.upper()}]*")
-
-        else:
-            # ismeretlen típus jelölése
-            emit(f"*[{t.upper()}]*")
-
-    for bl in blocks:
-        walk(bl, indent=0)
-
-    md = "\n".join(lines)
-    md = re.sub(r"\n{3,}", "\n\n", md)  # sok üres sor karcsúsítása
-    md = fix_numbered_lists(md)
-    return md
-
 def fix_numbered_lists(md: str) -> str:
-    """
-    Újraszámozza a '1. ' kezdetű listákat, kódfence-eken (```) kívül.
-    Többszintű behúzás támogatott (2 space = 1 szint).
-    """
     lines = md.splitlines()
     out = []
     in_code = False
@@ -407,13 +331,10 @@ def fix_numbered_lists(md: str) -> str:
 
         indent = is_num_item(line)
         if indent is None:
-            # ha nem listapont, nullázzuk az adott indentnél mélyebbeket
             out.append(line)
             continue
 
-        # számlálók kezelése az indent szinthez
-        # kisebb indent jött -> magasabbak törlése
-        to_del = [k for k in counters.keys() if k > indent]
+        to_del = [k for k in list(counters.keys()) if k > indent]
         for k in to_del:
             counters.pop(k, None)
         if indent not in counters:
@@ -426,6 +347,70 @@ def fix_numbered_lists(md: str) -> str:
         out.append(line)
 
     return "\n".join(out)
+
+def blocks_to_md(blocks: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+
+    def emit(s: str=""):
+        lines.append(s)
+
+    def walk(block, indent=0):
+        t = block.get("type")
+        b = block.get(t, {})
+        prefix = " " * indent
+
+        if t in ("paragraph","quote","callout","to_do","toggle","bulleted_list_item","numbered_list_item"):
+            content = rich_text_to_md(b.get("rich_text", []))
+            if t == "paragraph":
+                if content.strip():
+                    emit(prefix + content)
+                else:
+                    emit("")
+            elif t == "quote":
+                emit(prefix + "> " + content)
+            elif t == "callout":
+                emoji = b.get("icon", {}).get("emoji") if isinstance(b.get("icon"), dict) else ""
+                emit(prefix + f"> {emoji or '💡'} {content}")
+            elif t == "to_do":
+                ck = "[x]" if b.get("checked") else "[ ]"
+                emit(prefix + f"- {ck} {content}")
+            elif t == "bulleted_list_item":
+                emit(prefix + f"- {content}")
+            elif t == "numbered_list_item":
+                emit(prefix + f"1. {content}")
+            for c in block.get("_children", []):
+                walk(c, indent=indent+2)
+
+        elif t in ("heading_1","heading_2","heading_3"):
+            level = {"heading_1": "#", "heading_2": "##", "heading_3": "###"}[t]
+            content = rich_text_to_md(b.get("rich_text", []))
+            emit(f"{level} {content}")
+
+        elif t in ("divider",):
+            emit("\n---\n")
+
+        elif t in ("equation",):
+            ex = b.get("expression","")
+            if ex:
+                emit(f"$$ {ex} $$")
+
+        elif t in ("image","video","file","pdf"):
+            cap = rich_text_to_md(b.get("caption", [])) if b.get("caption") else ""
+            emit(f"*[{t.upper()}]* {cap}".rstrip())
+
+        elif t in ("table","table_row"):
+            emit(f"*[{t.upper()}]*")
+
+        else:
+            emit(f"*[{t.upper()}]*")
+
+    for bl in blocks:
+        walk(bl, indent=0)
+
+    md = "\n".join(lines)
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    md = fix_numbered_lists(md)
+    return md
 
 # ----------------------------
 # H2 alapú szeletelés
@@ -446,7 +431,6 @@ def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: Optional[
     norm_t = [normalize(x) for x in target_keys]
     norm_stop = [normalize(x) for x in stop_keys]
 
-    # keresd a cél H2-t
     target_idx = None
     for i, (pos, title) in enumerate(h2s):
         if normalize(title) in norm_t:
@@ -456,7 +440,6 @@ def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: Optional[
         return ""
 
     start_pos = h2s[target_idx][0]
-    # vágás a következő stop H2-ig (ha van)
     end_pos = len(md)
     for j in range(target_idx+1, len(h2s)):
         if normalize(h2s[j][1]) in norm_stop:
@@ -467,11 +450,9 @@ def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: Optional[
     return chunk.strip()
 
 def select_video_or_lesson(md: str) -> str:
-    # 1) Videó szöveg
-    s = _extract_section_by_h2(md, VIDEO_SECTION_KEYS, stop_keys=[])  # a belső H2-ket nem állítjuk meg
+    s = _extract_section_by_h2(md, VIDEO_SECTION_KEYS, stop_keys=[])
     if s.strip():
         return fix_numbered_lists(s)
-    # 2) Lecke szöveg
     s = _extract_section_by_h2(md, LESSON_SECTION_KEYS, stop_keys=[])
     if s.strip():
         return fix_numbered_lists(s)
@@ -494,21 +475,14 @@ def resolve_sorts(order_prop: Optional[str], title_prop: Optional[str]) -> List[
 # ----------------------------
 
 def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: str, prop_meta: Dict[str, Any]) -> Tuple[List[Tuple[str,int,set]], Dict[str, Dict[str, Any]]]:
-    """
-    Visszaad:
-      - groups_sorted: [(display_name, count, canonical_names_set), ...]
-      - display_to_canon: {display_name: {"canonical": set([...])}}
-    """
-    # 1) opciók az adatbázis sémából
-    id_to_opt = property_options_map(prop_meta)  # id -> {"name": ...}
-    # 2) oldalakból "seen nevek" összegyűjtése id-hez (átnevezésből maradt régi nevek)
+    id_to_opt = property_options_map(prop_meta)
     counts_by_id = {oid: 0 for oid in id_to_opt.keys()}
     seen_names_by_id = {oid: set() for oid in id_to_opt.keys()}
 
     pages = list_all_pages(client, dbid)
     for pg in pages:
         p = pg.get("properties", {}).get(prop_name)
-        if not p: 
+        if not p:
             continue
         if prop_type == "select":
             sel = p.get("select")
@@ -538,10 +512,8 @@ def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: st
                     if nm:
                         seen_names_by_id[oid].add(nm)
 
-    # 3) megjelenítési név (aliasolva) és kanonikus készlet
     display_to_canon: Dict[str, Dict[str, Any]] = {}
     items = []
-    # reverse alias (érték -> kulcsok)
     reverse_alias = {}
     for src, dst in DISPLAY_RENAMES.items():
         reverse_alias.setdefault(dst, set()).add(src)
@@ -550,7 +522,6 @@ def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: st
         current_name = meta.get("name","")
         display_name = DISPLAY_RENAMES.get(current_name, current_name)
         canon = set()
-        # kanonikus nevek: aktuális + seen + reverse alias + alias target
         canon.add(current_name)
         canon.update(seen_names_by_id.get(oid, set()))
         if display_name in reverse_alias:
@@ -561,7 +532,6 @@ def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: st
         items.append((display_name, count, canon))
         display_to_canon[display_name] = {"canonical": canon}
 
-    # 4) sorbarendezés mennyiség szerint
     items.sort(key=lambda x: x[1], reverse=True)
     return items, display_to_canon
 
@@ -604,7 +574,6 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
             "tartalom": tartalom or ""
         })
 
-    # rendezés mint a UI logika: sorszám szerint (ha van), különben cím szerint
     def _num(x):
         try:
             return float(str(x).replace(",", "."))
@@ -622,9 +591,8 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
 # ----------------------------
 
 def export_group_to_csv_bytes(rows: List[Dict[str,str]]) -> bytes:
-    df = pd.DataFrame(rows, columns=CSV_FIELDNAMES)
     buf = io.StringIO()
-    df.to_csv(buf, index=False)
+    pd.DataFrame(rows, columns=CSV_FIELDNAMES).to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8-sig")
 
 def sanitize_sheet_name(name: str) -> str:
@@ -640,7 +608,6 @@ def export_all_to_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str
         for display_name in groups_display:
             canon = display_to_canon.get(display_name, {}).get("canonical", set())
             rows: List[Dict[str,str]] = []
-            # az első nem üres kanonikus névre exportálunk
             for cname in canon:
                 rows = collect_rows_for_group(client, dbid, prop_name, prop_type, cname, title_prop, section_prop, order_prop, sorts)
                 if rows:
@@ -672,9 +639,8 @@ def export_all_to_single_csv(client: Client, dbid: str, prop_name: str, prop_typ
             r2 = dict(r)
             r2["csoport"] = display_name
             all_rows.append(r2)
-    df = pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES)
     buf = io.StringIO()
-    df.to_csv(buf, index=False)
+    pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8-sig")
 
 # ----------------------------
@@ -710,7 +676,7 @@ def main():
 
     client = get_notion_client()
     dbid = get_database_id()
-    schema = get_db_schema(client, dbid)
+    schema = get_db_schema(dbid)  # ⬅️ FIX: csak dbid megy a cache-be
 
     PROPERTY_NAME = get_property_name()
     group_prop_name, group_prop_type, group_prop_meta = find_group_property(schema, PROPERTY_NAME)
@@ -734,9 +700,7 @@ def main():
         st.info("Nem találtam csoportokat/értékeket.")
         st.stop()
 
-    # Megjelenítés
     st.subheader("Csoportok (db szerint csökkenő)")
-    options_labels = [f"{name} ({count})" for (name,count,_) in groups_sorted]
     options_values = [name for (name,_,_) in groups_sorted]
 
     selected = st.multiselect(
@@ -749,7 +713,6 @@ def main():
     st.divider()
     col1, col2, col3 = st.columns([1,1,1])
 
-    # 1) Összes egy fájlban – Excel
     with col1:
         st.markdown("#### Összes egy fájlban – Excel (több munkalap)")
         if st.button("⬇️ Letöltés (XLSX)"):
@@ -767,7 +730,6 @@ def main():
                 use_container_width=True
             )
 
-    # 2) Összes egy fájlban – CSV (egybefűzve)
     with col2:
         st.markdown("#### Összes egy fájlban – CSV (egybefűzve)")
         if st.button("⬇️ Letöltés (CSV)"):
@@ -785,7 +747,6 @@ def main():
                 use_container_width=True
             )
 
-    # 3) Egyenkénti CSV-k (opcionális, a kiválasztottakhoz)
     with col3:
         st.markdown("#### Kiválasztott csoportok – külön CSV-k")
         if not selected:
