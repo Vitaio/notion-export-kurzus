@@ -3,7 +3,6 @@ import io
 import csv
 import time
 import re
-import json
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
@@ -13,11 +12,10 @@ from notion_client import Client
 from notion_client.errors import APIResponseError
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Secrets → env bridge
+# Secrets → env bridge (Streamlit Cloud esetén hasznos)
 # ────────────────────────────────────────────────────────────────────────────────
 try:
-    for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD", "NOTION_PROPERTY_NAME",
-              "GOOGLE_SHEETS_SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT"):
+    for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD", "NOTION_PROPERTY_NAME"):
         if k in st.secrets and not os.getenv(k):
             os.environ[k] = str(st.secrets[k])
 except Exception:
@@ -30,36 +28,24 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 DATABASE_ID    = os.getenv("NOTION_DATABASE_ID", "").strip()
 APP_PASSWORD   = os.getenv("APP_PASSWORD", "").strip()
 
+# A csoportosításhoz használt property a Notion adatbázisban:
 PROPERTY_NAME  = os.getenv("NOTION_PROPERTY_NAME", "Kurzus").strip()
 
-GS_SHEET_ID    = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
-GS_SA_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT", "").strip()
-
+# Megjelenítési átnevezések: {VALÓDI_NÉV -> MIT MUTASSON A LISTÁBAN}
 DISPLAY_RENAMES: Dict[str, str] = {
     "Üzleti Modellek": "Milyen vállalkozást indíts",
     "Marketing rendszerek": "Ügyfélszerző marketing rendszerek",
 }
 
+# CSV oszlopok – egységes snake_case
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 
-# Google Sheets cella-limit védelme
-SHEETS_CELL_HARD_LIMIT = 50000
-SHEETS_CELL_SOFT_LIMIT = 49000  # biztonsági margó, hogy ne üssük a hard limitet
-
-# H2 kulcsszavak – BŐVÍTETT lista (videó/lecke tartalom minden variánsa)
-VIDEO_SECTION_KEYS = [
-    "videó szöveg","video szoveg","video szöveg","videó: szöveg","videó - szöveg",
-    "videó tartalom","video tartalom","videó","video","videó – szöveg","videó – tartalom"
-]
-LESSON_SECTION_KEYS = [
-    "lecke szöveg","lecke szoveg","lecke: szöveg","lecke - szöveg",
-    "lecke tartalom","lesson text","lecke","lecke – szöveg","lecke – tartalom"
-]
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Oldalbeállítás
 # ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Notion export – Kurzus", page_icon="📦", layout="centered")
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Autentikáció
@@ -82,13 +68,14 @@ def login_form() -> None:
             else:
                 st.error("Hibás jelszó.")
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Notion kliens és séma
+# Notion kliens és sémainformáció
 # ────────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_client() -> Client:
     if not NOTION_API_KEY:
-        raise RuntimeError("A NOTION_API_KEY nincs beállítva.")
+        raise RuntimeError("A NOTION_API_KEY nincs beállítva (környezeti változó vagy Streamlit Secrets).")
     return Client(auth=NOTION_API_KEY)
 
 @st.cache_data(ttl=120)
@@ -99,12 +86,14 @@ def get_database_schema() -> Dict:
 
 @st.cache_data(ttl=120)
 def get_property_type() -> Optional[str]:
+    """A csoportosító property (PROPERTY_NAME) típusa: select / multi_select / status."""
     db = get_database_schema()
     p = (db.get("properties", {}) or {}).get(PROPERTY_NAME)
     return p.get("type") if p else None
 
 @st.cache_data(ttl=120)
 def schema_id_to_current_name() -> Dict[str, str]:
+    """A PROPERTY_NAME opciók (id → jelenlegi név) táblája."""
     db = get_database_schema()
     props = db.get("properties", {}) or {}
     p = props.get(PROPERTY_NAME)
@@ -117,18 +106,20 @@ def schema_id_to_current_name() -> Dict[str, str]:
                     id2name[opt["id"]] = opt["name"]
     return id2name
 
-def with_backoff(fn, *args, retries: int = 6, **kwargs):
+def with_backoff(fn, *args, retries: int = 5, **kwargs):
+    """Egyszerű backoff réteg 429/5xx hibákra."""
     for i in range(retries):
         try:
             return fn(*args, **kwargs)
         except APIResponseError as e:
             status = getattr(e, "status", None)
-            if status in (409, 429, 500, 502, 503, 504):
-                time.sleep((1.5 ** i) + 0.2)
+            if status in (429, 500, 502, 503):
+                time.sleep((2 ** i) + 0.1)
                 continue
             raise
 
 def query_all_pages() -> List[Dict]:
+    """Az adatbázis minden oldalát lekéri lapozással (általános – NINCS szűrés/rendezés)."""
     client = get_client()
     results: List[Dict] = []
     cursor = None
@@ -141,11 +132,17 @@ def query_all_pages() -> List[Dict]:
     return results
 
 def query_filtered_pages(filter_: Dict, sorts: Optional[List[Dict]] = None) -> List[Dict]:
+    """Szűrt lekérdezés lapozással, opcionális rendezéssel (sorts)."""
     client = get_client()
     results: List[Dict] = []
     cursor = None
     while True:
-        kwargs = {"database_id": DATABASE_ID, "filter": filter_, "start_cursor": cursor, "page_size": 100}
+        kwargs = {
+            "database_id": DATABASE_ID,
+            "filter": filter_,
+            "start_cursor": cursor,
+            "page_size": 100
+        }
         if sorts:
             kwargs["sorts"] = sorts
         resp = with_backoff(client.databases.query, **kwargs)
@@ -155,8 +152,14 @@ def query_filtered_pages(filter_: Dict, sorts: Optional[List[Dict]] = None) -> L
         cursor = resp.get("next_cursor")
     return results
 
-@st.cache_data(ttl=300)
+
+@st.cache_data(ttl=120)
 def collect_used_ids_and_names() -> Tuple[Counter, Dict[str, Set[str]]]:
+    """
+    A PROPERTY_NAME property-hez:
+      - megszámoljuk az opciókat (id szerint),
+      - és összegyűjtjük, hogy az oldalakban milyen 'név' változatok fordultak elő.
+    """
     pages = query_all_pages()
     ptype = get_property_type()
     used_by_id: Counter = Counter()
@@ -190,19 +193,29 @@ def collect_used_ids_and_names() -> Tuple[Counter, Dict[str, Set[str]]]:
 
     return used_by_id, names_seen_by_id
 
+
 def build_display_list() -> List[Tuple[str, int, Set[str]]]:
+    """
+    Visszaadja a megjelenítési listát:
+      [(display_name, count, canonical_names), ...]
+      - display_name: amit a listában mutatunk (DISPLAY_RENAMES alkalmazva)
+      - canonical_names: ezzel próbálunk szűrni (aktuális név + esetleges régi variánsok + reverse aliasok)
+    """
     used_by_id, names_seen = collect_used_ids_and_names()
     id2current = schema_id_to_current_name()
 
+    # reverse alias tábla: {megjelenített_név → {régi_nevek}}
     reverse_alias: Dict[str, Set[str]] = defaultdict(set)
     for old, new in DISPLAY_RENAMES.items():
         reverse_alias[new].add(old)
 
     display_items: Dict[str, Dict[str, object]] = {}
     for oid, cnt in used_by_id.items():
+        # jelenlegi sémanév vagy oldalakon látott egyik név (árva fallback)
         current_candidates = names_seen.get(oid, set())
         current_name = id2current.get(oid) or (sorted(current_candidates)[0] if current_candidates else f"(árva {oid[:6]}...)")
         display_name = DISPLAY_RENAMES.get(current_name, current_name)
+
         canon: Set[str] = set([current_name]) | current_candidates | reverse_alias.get(display_name, set())
 
         entry = display_items.setdefault(display_name, {"count": 0, "canon": set()})
@@ -213,9 +226,9 @@ def build_display_list() -> List[Tuple[str, int, Set[str]]]:
         (disp, int(meta["count"]), set(meta["canon"]))  # type: ignore
         for disp, meta in display_items.items()
     ]
-    # UI listához: nagy → kicsi
     items.sort(key=lambda x: (-x[1], x[0].lower()))
     return items
+
 
 def build_filter(ptype: Optional[str], name: str) -> Dict:
     if ptype == "select":
@@ -226,24 +239,28 @@ def build_filter(ptype: Optional[str], name: str) -> Dict:
         return {"property": PROPERTY_NAME, "status": {"equals": name}}
     return {"property": PROPERTY_NAME, "select": {"equals": name}}
 
+
 def extract_title(page: Dict) -> str:
+    """Az oldal címének kinyerése."""
     props = page.get("properties", {}) or {}
     for _, val in props.items():
         if val.get("type") == "title":
             arr = val.get("title", []) or []
             if arr:
                 return " ".join(x.get("plain_text", "") for x in arr).strip() or "Névtelen oldal"
+    # fallback: ha a DB-ben konkrétan "Lecke címe" a title mező neve
     lekce = props.get("Lecke címe", {})
     if lekce.get("type") == "title" and lekce.get("title"):
         return " ".join((x.get("plain_text") or "") for x in lekce["title"]).strip() or "Névtelen oldal"
     return "Névtelen oldal"
 
 def resolve_title_prop_name() -> str:
+    """A DB-ben lévő cím (title) típusú property NEVE (az API a property-névvel várja a sortot)."""
     db = get_database_schema()
     for pname, meta in (db.get("properties", {}) or {}).items():
         if meta.get("type") == "title":
             return pname
-    return ""
+    return ""  # extrém esetben üres (nem reális egy DB-nél)
 
 def format_rich_text(rt_list: List[Dict]) -> str:
     out = ""
@@ -253,7 +270,14 @@ def format_rich_text(rt_list: List[Dict]) -> str:
         out += f"[{t}]({href})" if href else t
     return out
 
+
 def blocks_to_md(block_id: str, depth: int = 0) -> str:
+    """
+    Az oldal/blokk gyerekeit markdownná alakítja rekurzívan.
+
+    A számozott lista elemeket mindig „1.”-ként írjuk ki, majd a teljes szöveget
+    a végén újraszámozzuk (fix_numbered_lists), így a lapozás és beágyazás nem zavarja össze.
+    """
     client = get_client()
     lines: List[str] = []
     cursor = None
@@ -267,9 +291,9 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
             line = ""
 
             if btype in (
-                "paragraph","heading_1","heading_2","heading_3",
-                "bulleted_list_item","numbered_list_item",
-                "quote","to_do","callout","toggle"
+                "paragraph", "heading_1", "heading_2", "heading_3",
+                "bulleted_list_item", "numbered_list_item",
+                "quote", "to_do", "callout", "toggle"
             ):
                 txt = format_rich_text(data.get("rich_text", []))
                 prefix = ""
@@ -297,7 +321,7 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
             elif btype == "divider":
                 line = f"{indent}---"
 
-            elif btype in ("image","video","file","pdf"):
+            elif btype in ("image", "video", "file", "pdf"):
                 cap = format_rich_text(data.get("caption", []))
                 line = f"{indent}*[{btype.upper()}]* {cap}".rstrip()
 
@@ -315,10 +339,12 @@ def blocks_to_md(block_id: str, depth: int = 0) -> str:
 
     return "\n".join(lines)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Property felderítés „Szakasz” / „Sorszám”
+# Property felderítés „Szakasz” / „Sorszám” részére
 # ────────────────────────────────────────────────────────────────────────────────
 def _norm_key(s: str) -> str:
+    # ékezetek eltávolítása, lower, szóköz/alsóvonás/dísz jelek törlése
     if not isinstance(s, str):
         s = str(s or "")
     s = unicodedata.normalize("NFD", s)
@@ -328,15 +354,25 @@ def _norm_key(s: str) -> str:
         s = s.replace(ch, "")
     return s
 
-SECTION_TARGETS = ["szakasz","szekcio","section","modul","fejezet","rész","resz"]
-ORDER_TARGETS   = ["sorszám","sorszam","sorrend","order","index","pozicio","pozíció","rank"]
+SECTION_TARGETS = [
+    "szakasz", "szekcio", "section", "modul", "fejezet", "rész", "resz"
+]
+ORDER_TARGETS = [
+    "sorszám", "sorszam", "sorrend", "order", "index", "pozicio", "pozíció", "rank"
+]
 
 @st.cache_data(ttl=300)
 def resolve_section_and_order_props() -> Tuple[str, str]:
+    """
+    Visszaadja a Notion property kulcsnevét (pontosan), amit 'Szakasz' és 'Sorszám' alatt értsünk.
+    - Név szerinti (ékezet/kis-nagybetű/stb.) keresés szinonimákkal.
+    - Végül best-effort: 'select/multi_select/status' → szakasz; 'number' → sorszám.
+    """
     db = get_database_schema()
     props: Dict[str, Dict] = db.get("properties", {}) or {}
 
-    lookup = {_norm_key(k): k for k in props.keys()}
+    # Szakasz
+    lookup = { _norm_key(k): k for k in props.keys() }
     sec_key = ""
     for cand in SECTION_TARGETS + ["szakasz"]:
         key = lookup.get(_norm_key(cand))
@@ -344,18 +380,21 @@ def resolve_section_and_order_props() -> Tuple[str, str]:
             sec_key = key
             break
     if not sec_key:
+        # típus szerinti tipp: kategorizáló property
         for k, v in props.items():
-            if v.get("type") in ("select","multi_select","status"):
+            if v.get("type") in ("select", "multi_select", "status"):
                 sec_key = k
                 break
 
+    # Sorszám
     ord_key = ""
-    for cand in ORDER_TARGETS + ["sorszám","sorszam"]:
+    for cand in ORDER_TARGETS + ["sorszám", "sorszam"]:
         key = lookup.get(_norm_key(cand))
         if key:
             ord_key = key
             break
     if not ord_key:
+        # típus szerinti tipp: number property
         for k, v in props.items():
             if v.get("type") == "number":
                 ord_key = k
@@ -363,42 +402,57 @@ def resolve_section_and_order_props() -> Tuple[str, str]:
 
     return (sec_key or ""), (ord_key or "")
 
+
 def format_property_for_csv(page: Dict, prop_name: str) -> str:
+    """
+    Általános property-kivonat CSV-hez.
+    Lefedi: number, select, multi_select, status, rich_text, date, url, email, people, title.
+    """
     if not prop_name:
         return ""
     props = page.get("properties", {}) or {}
     p = props.get(prop_name)
     if not p:
         return ""
+
     ptype = p.get("type")
     try:
         if ptype == "number":
             val = p.get("number", None)
             return "" if val is None else str(val)
+
         if ptype == "select":
             node = p.get("select") or {}
             return (node.get("name") or "").strip()
+
         if ptype == "multi_select":
             arr = p.get("multi_select") or []
             return ", ".join((x.get("name") or "").strip() for x in arr if x.get("name"))
+
         if ptype == "status":
             node = p.get("status") or {}
             return (node.get("name") or "").strip()
+
         if ptype == "rich_text":
             arr = p.get("rich_text") or []
             return " ".join((x.get("plain_text") or "") for x in arr).strip()
+
         if ptype == "title":
             arr = p.get("title") or []
             return " ".join((x.get("plain_text") or "") for x in arr).strip()
+
         if ptype == "date":
             node = p.get("date") or {}
             start = node.get("start") or ""
             end   = node.get("end") or ""
             return f"{start}..{end}" if end else start
+
         if ptype == "url":
             return p.get("url") or ""
+
         if ptype == "email":
             return p.get("email") or ""
+
         if ptype == "people":
             arr = p.get("people") or []
             names = []
@@ -409,31 +463,53 @@ def format_property_for_csv(page: Dict, prop_name: str) -> str:
                 if name:
                     names.append(name)
             return ", ".join(names)
+
         return ""
     except Exception:
         return ""
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Rendezés kiválasztása
+# Rendezés kiválasztása: 1) Sorszám property ↑  2) ABC cím szerint ↑
 # ────────────────────────────────────────────────────────────────────────────────
 def resolve_sorts(order_prop: Optional[str]) -> Tuple[List[Dict], str]:
+    """
+    Visszaadja a Notion API "sorts" listát és egy emberi leírást.
+    Követelmény:
+      1) Ha van 'Sorszám' property → aszerint növekvő
+      2) Ha nincs → cím (title property) szerint ABC (növekvő)
+    """
     if order_prop:
         return [{"property": order_prop, "direction": "ascending"}], f"property: {order_prop} ↑"
+
     title_prop = resolve_title_prop_name()
     if title_prop:
         return [{"property": title_prop, "direction": "ascending"}], f"title: {title_prop} ↑"
+
+    # legvégső fallback – nem valószínű, hogy kell
     return [], "unspecified (API default)"
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Markdown H2 → szakasz kivágás (cél H2-től a KÖVETKEZŐ H2-ig)
+# Markdown szűrés + számozott listák ÚJRASZÁMOZÁSA
 # ────────────────────────────────────────────────────────────────────────────────
+def _normalize(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.strip().lower()
+
 def _norm_heading_key(s: str) -> str:
+    """H2 cím egyezéshez: ékezetek törlése, lower, minden nem alfanumerikus eltávolítása."""
     s = unicodedata.normalize("NFD", s or "")
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     s = s.lower()
     return re.sub(r"[^a-z0-9]+", "", s)
 
 def _find_h2_positions(md: str) -> List[Tuple[int, str, str]]:
+    """
+    Visszaadja az összes H2 címet: (sorszám a lines-ban, eredeti_cím, norm_kulcs)
+    Csak a '## ' szintet vesszük H2-nek.
+    """
     lines = (md or "").splitlines()
     out = []
     for i, line in enumerate(lines):
@@ -443,34 +519,13 @@ def _find_h2_positions(md: str) -> List[Tuple[int, str, str]]:
             out.append((i, title, _norm_heading_key(title)))
     return out
 
-def _extract_section_by_h2(md: str, target_keys: List[str]) -> str:
-    lines = (md or "").splitlines()
-    h2s = _find_h2_positions(md)
-    if not h2s:
-        return ""
-    target_keys_n = set(_norm_heading_key(k) for k in target_keys)
-
-    start_idx = None
-    for (i, _title, key) in h2s:
-        if key in target_keys_n:
-            start_idx = i
-            break
-    if start_idx is None:
-        return ""
-
-    # Következő H2-ig
-    stop_idx = None
-    for (i, _title, _key) in h2s:
-        if i > start_idx:
-            stop_idx = i
-            break
-
-    from_line = start_idx + 1
-    to_line = stop_idx if stop_idx is not None else len(lines)
-    chunk = "\n".join(lines[from_line:to_line]).strip()
-    return chunk
-
 def fix_numbered_lists(md: str) -> str:
+    """
+    ÚJRASZÁMOZÁS:
+      - csak azokat a sorokat módosítja, amelyek *szóközök után* közvetlenül „szám + . + szóköz” mintával kezdődnek.
+      - figyeli a kódblokkokat (```), azokat érintetlenül hagyja.
+      - kezeli a beágyazott tartalmat: a listához tartozó, de jobban behúzott sorok nem szakítják meg a számozást.
+    """
     lines = (md or "").splitlines()
     out: List[str] = []
     in_code = False
@@ -522,23 +577,93 @@ def fix_numbered_lists(md: str) -> str:
 
     return "\n".join(out)
 
+def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: List[str]) -> str:
+    """
+    A teljes markdownból kivágja a *megadott H2 címmel* kezdődő szakaszt úgy,
+    hogy CSAK a következő *stop* H2-ig vág, MÁS H2-k nem állítják meg, ha nem stop-key.
+    (Ezzel elkerüljük, hogy a szakaszon BELÜLI H2-k „félbevágják” a tartalmat.)
+    """
+    lines = (md or "").splitlines()
+    h2s = _find_h2_positions(md)
+    if not h2s:
+        return ""  # nincs H2 a dokumentumban
+
+    target_keys_n = set(_norm_heading_key(k) for k in target_keys)
+    stop_keys_n   = set(_norm_heading_key(k) for k in stop_keys)
+
+    # start: az első H2, aminek norm_kulcsa cél
+    start_idx = None
+    for (i, title, key) in h2s:
+        if key in target_keys_n:
+            start_idx = i
+            break
+    if start_idx is None:
+        return ""
+
+    # stop: a start utáni első H2, aminek norm_kulcsa stop
+    stop_idx = None
+    for (i, title, key) in h2s:
+        if i > start_idx and key in stop_keys_n:
+            stop_idx = i
+            break
+
+    # a start H2 utáni sortól a stop H2 előtti sorig
+    from_line = start_idx + 1
+    to_line = stop_idx if stop_idx is not None else len(lines)
+    chunk = "\n".join(lines[from_line:to_line]).strip()
+    return chunk
+
 def select_video_or_lesson(md: str) -> str:
-    s = _extract_section_by_h2(md, VIDEO_SECTION_KEYS)
-    if re.search(r"\S", s):
-        return fix_numbered_lists(s)
-    s = _extract_section_by_h2(md, LESSON_SECTION_KEYS)
-    if re.search(r"\S", s):
-        return fix_numbered_lists(s)
+    """
+    Logika:
+      - Ha a „Videó szöveg” szakasz NEM üres → azt adja vissza (belső H2-ket is beleértve).
+      - Egyébként, ha a „Lecke szöveg” NEM üres → azt adja vissza.
+      - Különben üres.
+    A kivágott szöveget a végén újraszámozzuk (fix_numbered_lists).
+    """
+    # Olyan esetekre is jó, amikor a cím végén : vagy – szerepel, illetve extra szóközök vannak
+    video = _extract_section_by_h2(
+        md,
+        target_keys=["Videó szöveg", "Video szoveg", "Videó szöveg:", "Videó szöveg –"],
+        stop_keys=["Lecke szöveg", "Lecke szöveg:", "Megjegyzés", "Megjegyzes", "Videó szöveg", "Video szoveg"]
+    )
+    if re.search(r"\S", video):
+        return fix_numbered_lists(video)
+
+    lesson = _extract_section_by_h2(
+        md,
+        target_keys=["Lecke szöveg", "Lecke szoveg", "Lecke szöveg:", "Lecke szöveg –"],
+        stop_keys=["Videó szöveg", "Video szoveg", "Videó szöveg:", "Megjegyzés", "Megjegyzes", "Lecke szöveg", "Lecke szoveg"]
+    )
+    if re.search(r"\S", lesson):
+        return fix_numbered_lists(lesson)
+
     return ""
 
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Közös sor-gyűjtő
+# Export
 # ────────────────────────────────────────────────────────────────────────────────
-def collect_rows_for_display_group(display_name: str, canonical_names: Set[str]) -> List[Dict[str, str]]:
+def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
+    """
+    Egy megjelenítési csoport (display_name) exportja CSV-be.
+    Rendezés:
+      - ha van dedikált 'Sorszám' property → annak értéke szerint növekvő
+      - különben: cím (title) szerint ABC
+    A CSV 'tartalom' mező:
+      - a „Videó szöveg” H2 alatti rész *egészben* (belső H2-ket is tartalmazva), ha nem üres;
+      - különben a „Lecke szöveg” H2 alatti rész *egészben*;
+      - különben üres.
+      - a számozott listákat mindig 1., 2., 3. … formára újraszámozzuk.
+    A CSV 'sorszam' mező:
+      - ha van 'Sorszám' property → annak értéke,
+      - különben üres (nincs explicit sorszám a DB-ben).
+    """
     ptype = get_property_type()
     section_prop, order_prop = resolve_section_and_order_props()
-    sorts, _ = resolve_sorts(order_prop)
+    sorts, _sort_desc = resolve_sorts(order_prop)
 
+    # próbáljunk végig több néven, első találat nyer
     pages: List[Dict] = []
     for nm in sorted(canonical_names, key=lambda s: (0 if s == display_name else 1, s)):
         try:
@@ -549,151 +674,39 @@ def collect_rows_for_display_group(display_name: str, canonical_names: Set[str])
             pages = subset
             break
 
-    rows: List[Dict[str, str]] = []
+    # CSV összeállítása memóriában
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDNAMES)
+    writer.writeheader()
+
     for page in pages:
         pid   = page.get("id")
         title = extract_title(page)
         try:
             raw_md = blocks_to_md(pid).strip()
-            content = select_video_or_lesson(raw_md)
+            content = select_video_or_lesson(raw_md)  # feltételes kivágás (belső H2-k megőrzése) + újraszámozás
         except Exception as e:
             content = f"[HIBA: {e}]"
 
-        rows.append({
+        sorszam_value = format_property_for_csv(page, order_prop) if order_prop else ""
+
+        row = {
             "oldal_cime": title,
             "szakasz": format_property_for_csv(page, section_prop),
-            "sorszam": format_property_for_csv(page, order_prop) if order_prop else "",
+            "sorszam": sorszam_value,
             "tartalom": content,
-        })
-        time.sleep(0.01)
-    return rows
+        }
+        writer.writerow(row)
+        time.sleep(0.01)  # udvarias tempó
 
-def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
-    rows = collect_rows_for_display_group(display_name, canonical_names)
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDNAMES)
-    writer.writeheader()
-    for r in rows:
-        writer.writerow(r)
     return buf.getvalue().encode("utf-8")
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Google Sheets segédek (+ hosszú cella darabolás)
-# ────────────────────────────────────────────────────────────────────────────────
-def sheets_enabled() -> bool:
-    return bool(GS_SHEET_ID and GS_SA_JSON)
-
-def _gs_client():
-    import gspread
-    creds = json.loads(GS_SA_JSON)
-    return gspread.service_account_from_dict(creds)
-
-def _gs_open_spreadsheet():
-    gc = _gs_client()
-    return gc.open_by_key(GS_SHEET_ID)
-
-def _sanitize_sheet_title(name: str) -> str:
-    name = re.sub(r'[:\\/?*\\[\\]]', '_', name)
-    return name[:31] if len(name) > 31 else name or "lap"
-
-def _gs_get_or_create_ws(sh, title: str):
-    safe = _sanitize_sheet_title(title)
-    try:
-        return sh.worksheet(safe)
-    except Exception:
-        return sh.add_worksheet(title=safe, rows=100, cols=10)
-
-def _ws_clear_and_header(ws, header: List[str]):
-    ws.clear()
-    ws.update("A1", [header])
-
-def _ws_append_rows(ws, rows: List[List[str]]):
-    CHUNK = 200
-    for i in range(0, len(rows), CHUNK):
-        batch = rows[i:i+CHUNK]
-        for attempt in range(1, 5):
-            try:
-                ws.append_rows(batch, value_input_option="RAW", table_range="A1")
-                break
-            except Exception:
-                time.sleep(0.6 * attempt)
-                if attempt == 4:
-                    raise
-
-def _split_long_text_for_sheets(text: str, soft_limit: int = SHEETS_CELL_SOFT_LIMIT) -> List[str]:
-    """Vágja fel a hosszú tartalmat több cellába (sorra), hogy ne lépjük túl a 50k limitet."""
-    s = text or ""
-    if len(s) <= soft_limit:
-        return [s]
-    parts: List[str] = []
-    while s:
-        chunk = s[:soft_limit]
-        # próbáljunk bekezdés végére vágni
-        cut = chunk.rfind("\n")
-        if cut >= int(soft_limit * 0.6):
-            chunk = chunk[:cut]
-        parts.append(chunk)
-        s = s[len(chunk):]
-    return parts
-
-def _rows_to_sheet_values(rows: List[Dict[str, str]]) -> List[List[str]]:
-    """
-    A CSV-vel AZONOS oszlopok készülnek.
-    Ha a „tartalom” túl hosszú, több sorra törjük. A „folytatás” jelzést a címhez tesszük.
-    """
-    values: List[List[str]] = []
-    for r in rows:
-        parts = _split_long_text_for_sheets(r.get("tartalom",""))
-        n = len(parts)
-        for i, part in enumerate(parts, start=1):
-            title = r.get("oldal_cime","")
-            if n > 1:
-                title = f"{title} (folytatás {i}/{n})"
-            values.append([title, r.get("szakasz",""), r.get("sorszam",""), part])
-    return values
-
-def sync_all_groups_to_sheets(items: List[Tuple[str, int, Set[str]]], canon_by_name: Dict[str, Set[str]]) -> None:
-    """
-    Google Sheets szinkron – a LEGKISEBBTŐL a legnagyobbig.
-    Minden csoport külön munkalapra kerül, a CSV-vel azonos oszlopokkal.
-    A túl hosszú „tartalom” mezők több sorra vágva kerülnek fel.
-    """
-    if not sheets_enabled():
-        st.error("Google Sheets nincs bekapcsolva (GOOGLE_SHEETS_SPREADSHEET_ID / GOOGLE_SERVICE_ACCOUNT).")
-        return
-
-    sh = _gs_open_spreadsheet()
-    items_asc = sorted(items, key=lambda t: (t[1], t[0].lower()))  # count ↑
-
-    bar = st.progress(0, text="Google Sheets szinkron indul…")
-    log = st.empty()
-
-    total = len(items_asc)
-    for idx, (display_name, count, _canon) in enumerate(items_asc, start=1):
-        try:
-            log.info(f"„{display_name}” – adatok gyűjtése és feltöltése… (kb. {count} oldal)")
-            rows = collect_rows_for_display_group(display_name, canon_by_name[display_name])
-
-            ws = _gs_get_or_create_ws(sh, display_name)
-            _ws_clear_and_header(ws, CSV_FIELDNAMES)
-
-            values = _rows_to_sheet_values(rows)
-            if values:
-                _ws_append_rows(ws, values)
-
-            pct = int(idx * 100 / total)
-            bar.progress(pct, text=f"Sheets: {idx}/{total} kész – utolsó: {ws.title} ({len(values)} sor)")
-        except Exception as e:
-            st.error(f"„{display_name}” lap szinkron hiba: {e}")
-            # folytatjuk a következővel
-
-    st.success("Google Sheets szinkron kész ✅")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # UI
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a Videó/Lecke H2 alatti rész – számozott listák újraszámozva. Sheets-ben a 50k cellalimit miatt a hosszú tartalmak több sorra törve kerülnek fel.")
+st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a teljes Videó szöveg (ha üres: Lecke szöveg) – belső H2-ket is tartalmaz, a számozott listák automatikusan újraszámozva.")
 
 # Jelszó
 if need_auth():
@@ -728,32 +741,18 @@ with st.expander("Részletek (felismert mezők és rendezés)"):
 
 pick = st.multiselect("Válaszd ki, mit exportáljunk:", labels, max_selections=None)
 
-col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("Exportálás (CSV)"):
-        if not pick:
-            st.warning("Válassz legalább egy elemet.")
-        else:
-            for lbl in pick:
-                name = name_by_label[lbl]
-                data = export_one(name, canon_by_name[name])
-                fname_safe = re.sub(r"[^\w\-. ]", "_", name).strip().replace(" ", "_")
-                st.download_button(
-                    label=f"Letöltés: {name}.csv",
-                    data=data,
-                    file_name=f"export_Kurzus_{fname_safe}.csv",
-                    mime="text/csv",
-                    key=f"dl-{fname_safe}",
-                )
-
-with col2:
-    st.markdown("**Google Sheets szinkron** – külön lapokra, **legkisebbtől a legnagyobbig**. Hosszú tartalom több sorban.")
-    if sheets_enabled():
-        if st.button("Google Sheet szinkron indítása"):
-            try:
-                sync_all_groups_to_sheets(items, canon_by_name)
-            except Exception as e:
-                st.error(f"Szinkron hiba: {e}")
+if st.button("Exportálás (CSV)"):
+    if not pick:
+        st.warning("Válassz legalább egy elemet.")
     else:
-        st.info("A Google Sheets szinkronhoz add meg a `GOOGLE_SHEETS_SPREADSHEET_ID` és `GOOGLE_SERVICE_ACCOUNT` secreteket.")
+        for lbl in pick:
+            name = name_by_label[lbl]
+            data = export_one(name, canon_by_name[name])
+            fname_safe = re.sub(r"[^\w\-. ]", "_", name).strip().replace(" ", "_")
+            st.download_button(
+                label=f"Letöltés: {name}.csv",
+                data=data,
+                file_name=f"export_Kurzus_{fname_safe}.csv",
+                mime="text/csv",
+                key=f"dl-{fname_safe}",
+            )
