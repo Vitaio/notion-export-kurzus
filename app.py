@@ -1,3 +1,4 @@
+
 # app.py
 # Streamlit + Notion export (resumable, progress, counts, disappearing login)
 # Env/Secrets: NOTION_API_KEY, NOTION_DATABASE_ID, APP_PASSWORD, NOTION_PROPERTY_NAME (default: "Kurzus")
@@ -8,6 +9,7 @@ from typing import Dict, List, Any, Tuple, Optional
 
 import streamlit as st
 import pandas as pd
+
 try:
     from slugify import slugify
 except Exception:
@@ -292,7 +294,8 @@ def fetch_blocks(client: Client, block_id: str) -> List[Dict[str, Any]]:
     results = []
     cursor = None
     while True:
-        resp = client.blocks.children.list(block_id=block_id, start_cursor=cursor) if cursor             else client.blocks.children.list(block_id=block_id)
+        resp = client.blocks.children.list(block_id=block_id, start_cursor=cursor) if cursor \
+            else client.blocks.children.list(block_id=block_id)
         results.extend(resp.get("results", []))
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
@@ -582,7 +585,7 @@ def _excel_writer(output_io):
             st.stop()
 
 def sanitize_sheet_name(name: str) -> str:
-    name = re.sub(r'[:\\/?*\[\]]', "_", name)
+    name = re.sub(r'[:\\/?*\\[\\]]', "_", name)
     return name[:31] if len(name) > 31 else name
 
 # ----------------------------
@@ -614,7 +617,6 @@ def checkpoint_uploader(label="🔁 Checkpoint betöltése"):
     if up is not None:
         try:
             meta = json.load(up)
-            # basic validation
             if not isinstance(meta, dict) or "mode" not in meta or "groups" not in meta:
                 st.error("Érvénytelen checkpoint fájl.")
             else:
@@ -635,11 +637,8 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     reporter = ProgressReporter(total_steps=len(remaining), title="XLSX export folyamatban… (folytatható)")
     output = io.BytesIO()
     with _excel_writer(output) as writer:
-        # Recompute already-done sheets too at the end so the final file tartalmazza mindet
-        # (könnyebb és megbízhatóbb, mint részlegesen tárolni).
         all_for_final = []
 
-        # 1) Először: feldolgozzuk az ÖSSZES csoportot, de haladás és checkpoint 'done' csak a remaining-hez nő.
         for display_name in groups:
             canon = display_to_canon.get(display_name, {}).get("canonical", set())
             rows: List[Dict[str,str]] = []
@@ -652,7 +651,6 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                 meta["done"].append(display_name)
                 reporter.tick(f"{display_name} – {len(rows)} sor kész.")
 
-        # 2) Kiírás a végén (egyszer)
         for display_name, rows in all_for_final:
             df = pd.DataFrame(rows, columns=CSV_FIELDNAMES)
             sheet = sanitize_sheet_name(display_name) or "lap"
@@ -664,7 +662,6 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
 
     output.seek(0)
     reporter.finish(ok=True, msg="XLSX elkészült.")
-    # teljesítve -> törölhetjük a resume-t
     st.session_state.pop("resume", None)
     return output.read()
 
@@ -680,7 +677,6 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
     reporter = ProgressReporter(total_steps=len(remaining), title="CSV (egybefűzött) export folyamatban… (folytatható)")
     all_rows: List[Dict[str,str]] = []
 
-    # Mindet újraszámoljuk, de haladást és done-t csak a remaining-hez írunk.
     for display_name in groups:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
@@ -717,7 +713,7 @@ def require_login():
         if pw == app_pw:
             st.session_state.authed = True
             st.success("Sikeres belépés.")
-            st.rerun()  # eltüntetjük azonnal a login formot
+            st.rerun()
         else:
             st.error("Hibás jelszó.")
     st.stop()
@@ -742,16 +738,14 @@ def main():
     sorts = resolve_sorts(order_prop, title_prop)
 
     with st.expander("ℹ️ Használt mezők és rendezés", expanded=False):
-        st.write(
-            f"**Csoportosítás**: `{group_prop_name}` (*{group_prop_type}*)  
-"
-            f"**Cím property**: `{title_prop or '—'}`  
-"
-            f"**Szakasz property**: `{section_prop or '—'}`  
-"
-            f"**Sorszám property**: `{order_prop or '—'}`  
-"
-            f"**Rendezés**: {'Sorszám ↑' if order_prop else 'Cím ↑'}"
+        st.markdown(
+            f"""
+**Csoportosítás**: `{group_prop_name}` (*{group_prop_type}*)  
+**Cím property**: `{title_prop or '—'}`  
+**Szakasz property**: `{section_prop or '—'}`  
+**Sorszám property**: `{order_prop or '—'}`  
+**Rendezés**: {"Sorszám ↑" if order_prop else "Cím ↑"}
+            """
         )
 
     st.write("Adatok beolvasása…")
