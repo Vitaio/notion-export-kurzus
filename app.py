@@ -1,13 +1,17 @@
-# app.py — Notion → Export (Kurzus) • v7-stable
+# app.py — Notion → Export (Kurzus) • v8 (Google Sheets realtime opcionális)
 # - Multiselect: "Név (db)"
 # - Login után st.rerun() → login UI eltűnik
 # - Progress bar + státusz log
-# - XLSX több munkalappal + egybefűzött CSV
+# - XLSX több munkalap + egybefűzött CSV
 # - XlsxWriter → openpyxl fallback
-# - Folytatható export: checkpoint (cache + done)
+# - Folytatható export: checkpoint (cache + done) Streamlit sessionben
 # - Robusztus Notion retry (409/429/5xx), 403/404 skip
 # - Watchdog: AUTO_RERUN_SECONDS / MAX_GROUPS_PER_RUN / AUTO_RESUME
-# - Stabilitási javítások: függvények definíciói egységesítve és a használat előtt deklarálva
+# - ÚJ: Opcionális **Google Sheets** integráció (valós idejű írás)
+#   * Secrets: GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT (JSON)
+#   * 'Resume' munkalapra JSON állapot, csoportonként külön lap
+#   * Futás közben csoportonként (vagy részfutam végén) azonnali mentés Sheet-be
+#   * Resume: ha van 'Resume' lapon mentett meta és nincs session állapot, automatikusan betölti
 
 from __future__ import annotations
 import os, io, re, time, math, unicodedata, json, random
@@ -17,7 +21,7 @@ from typing import Dict, List, Any, Tuple, Optional
 import streamlit as st
 import pandas as pd
 
-__VERSION__ = "v7-stable"
+__VERSION__ = "v8-sheets"
 
 # ----------------------------
 # Utilities
@@ -34,6 +38,15 @@ except Exception:
 # Notion
 from notion_client import Client  # type: ignore
 from notion_client.errors import APIResponseError, HTTPResponseError  # type: ignore
+
+# Optional: Google Sheets (gspread)
+GSPREAD_AVAILABLE = False
+try:
+    import gspread  # type: ignore
+    from gspread.exceptions import APIError as GSpreadAPIError  # type: ignore
+    GSPREAD_AVAILABLE = True
+except Exception:
+    pass
 
 # ----------------------------
 # Config / constants
@@ -112,6 +125,84 @@ def get_database_id() -> str:
 def get_db_schema(dbid: str) -> Dict[str, Any]:
     client = get_notion_client()
     return client.databases.retrieve(database_id=dbid)
+
+# ----------------------------
+# Google Sheets helpers (optional)
+# ----------------------------
+def is_sheets_enabled() -> bool:
+    return GSPREAD_AVAILABLE and bool(_get_secret("GOOGLE_SHEETS_SPREADSHEET_ID")) and bool(_get_secret("GOOGLE_SERVICE_ACCOUNT"))
+
+def get_gs_client():
+    if not is_sheets_enabled():
+        return None
+    try:
+        creds = json.loads(_get_secret("GOOGLE_SERVICE_ACCOUNT", "{}"))
+        return gspread.service_account_from_dict(creds)
+    except Exception as e:
+        st.error(f"Google Sheets hitelesítés sikertelen: {e}")
+        return None
+
+def get_spreadsheet():
+    gc = get_gs_client()
+    if not gc:
+        return None
+    sid = _get_secret("GOOGLE_SHEETS_SPREADSHEET_ID")
+    try:
+        return gc.open_by_key(sid)
+    except Exception as e:
+        st.error(f"Google Spreadsheet megnyitása sikertelen: {e}")
+        return None
+
+def get_or_create_ws(sh, name: str):
+    # Max 31 char + tiltott karakter cseréje
+    safe = re.sub(r'[:\\/?*\\[\\]]', "_", name)[:31] or "lap"
+    try:
+        return sh.worksheet(safe)
+    except Exception:
+        # create
+        try:
+            return sh.add_worksheet(title=safe, rows=100, cols=10)
+        except Exception as e:
+            st.error(f"Worksheet létrehozás sikertelen ({safe}): {e}")
+            return None
+
+def ws_clear_and_header(ws, header: List[str]):
+    try:
+        ws.clear()
+        ws.update("A1", [header])
+    except Exception as e:
+        st.error(f"Worksheet tisztítás/fejléc hiba ({ws.title}): {e}")
+
+def ws_append_rows(ws, rows: List[List[str]]):
+    # Append in batches to reduce API calls
+    CHUNK = 200
+    for i in range(0, len(rows), CHUNK):
+        batch = rows[i:i+CHUNK]
+        for attempt in range(1, 5):
+            try:
+                ws.append_rows(batch, value_input_option="RAW", table_range=f"A1")
+                break
+            except Exception as e:
+                time.sleep(0.7 * attempt)
+                if attempt == 4:
+                    st.error(f"Google Sheets írás hiba ({ws.title}): {e}")
+
+def resume_sheet_read(sh):
+    try:
+        ws = get_or_create_ws(sh, "Resume")
+        val = ws.acell("A1").value
+        if not val:
+            return None
+        return json.loads(val)
+    except Exception:
+        return None
+
+def resume_sheet_write(sh, meta: dict):
+    try:
+        ws = get_or_create_ws(sh, "Resume")
+        ws.update("A1", [[json.dumps(meta, ensure_ascii=False)]])
+    except Exception as e:
+        st.error(f"Resume írás hiba: {e}")
 
 # ----------------------------
 # Notion robust layer
@@ -653,11 +744,11 @@ def sanitize_sheet_name(name: str) -> str:
     return name[:31] if len(name) > 31 else name
 
 # ----------------------------
-# Resumable export + Watchdog
+# Resumable export + Watchdog + Google Sheets persist
 # ----------------------------
 def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: str):
     st.session_state["resume"] = {
-        "version": 5,
+        "version": 6,
         "mode": mode,
         "property_name": property_name,
         "dbid": dbid,
@@ -666,6 +757,11 @@ def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: 
         "cache": {},
         "created_at": datetime.utcnow().isoformat()+"Z",
     }
+    # Persist to Sheets (if enabled)
+    if is_sheets_enabled():
+        sh = get_spreadsheet()
+        if sh:
+            resume_sheet_write(sh, st.session_state["resume"])
 
 def get_resume():
     meta = st.session_state.get("resume")
@@ -675,12 +771,49 @@ def get_resume():
         meta["done"] = []
     return meta
 
+def maybe_load_resume_from_sheets(dbid: str, prop_name: str):
+    if get_resume():
+        return
+    if not is_sheets_enabled():
+        return
+    sh = get_spreadsheet()
+    if not sh:
+        return
+    meta = resume_sheet_read(sh)
+    if isinstance(meta, dict) and meta.get("dbid") == dbid and meta.get("property_name") == prop_name:
+        st.session_state["resume"] = meta
+        st.info("Google Sheetről betöltöttem a korábbi futás állapotát (Resume).")
+
 def _cache_put(meta: dict, display_name: str, rows: List[Dict[str,str]]):
     meta["cache"][display_name] = {
         "rows": rows,
         "count": len(rows),
         "ts": datetime.utcnow().isoformat()+"Z"
     }
+
+def _sheets_write_group(display_name: str, rows: List[Dict[str,str]]):
+    if not is_sheets_enabled():
+        return
+    sh = get_spreadsheet()
+    if not sh:
+        return
+    ws = get_or_create_ws(sh, display_name)
+    if not ws:
+        return
+    ws_clear_and_header(ws, CSV_FIELDNAMES)
+    # map rows -> lists
+    values = [[r.get("oldal_cime",""), r.get("szakasz",""), r.get("sorszam",""), r.get("tartalom","")] for r in rows]
+    ws_append_rows(ws, values)
+
+def _sheets_update_resume():
+    if not is_sheets_enabled():
+        return
+    sh = get_spreadsheet()
+    if not sh:
+        return
+    meta = get_resume()
+    if meta:
+        resume_sheet_write(sh, meta)
 
 def checkpoint_download_button(label="💾 Checkpoint letöltése"):
     meta = get_resume()
@@ -718,10 +851,8 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
 
-    reporter = st.empty()
     bar = st.progress(0)
     log = st.empty()
-
     total_steps = max(1, len(remaining))
     processed = 0
     start_ts = time.time()
@@ -739,7 +870,11 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
             if rows:
                 break
         _cache_put(meta, display_name, rows)
+        # Sheets-be azonnali mentés (csoport kész)
+        _sheets_write_group(display_name, rows)
         meta["done"].append(display_name)
+        _sheets_update_resume()
+
         processed += 1
         pct = int(processed * 100 / total_steps)
         bar.progress(pct)
@@ -757,6 +892,7 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                 st.session_state["auto_resume_pending"] = True
             st.rerun()
 
+    # Lokális XLSX az összes csoportból (cache)
     output = io.BytesIO()
     with _excel_writer(output) as writer:
         for display_name in groups:
@@ -772,6 +908,7 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     output.seek(0)
     st.success("XLSX elkészült.")
     st.session_state.pop("resume", None)
+    # Végállapot kiírása is megmarad a Resume lapon az utolsó mentéssel
     return output.read()
 
 def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
@@ -805,7 +942,10 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
             if rows:
                 break
         _cache_put(meta, display_name, rows)
+        _sheets_write_group(display_name, rows)
         meta["done"].append(display_name)
+        _sheets_update_resume()
+
         processed += 1
         pct = int(processed * 100 / total_steps)
         bar.progress(pct)
@@ -823,6 +963,7 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
                 st.session_state["auto_resume_pending"] = True
             st.rerun()
 
+    # Egybefűzött CSV (cache-ből)
     all_rows: List[Dict[str,str]] = []
     for display_name in groups:
         rows = meta["cache"].get(display_name, {}).get("rows", [])
@@ -867,14 +1008,20 @@ def main():
     client = get_notion_client()
     dbid = get_database_id()
     schema = get_db_schema(dbid)
-
     PROPERTY_NAME = get_property_name()
-    group_prop_name, group_prop_type, group_prop_meta = find_group_property(schema, PROPERTY_NAME)
 
+    group_prop_name, group_prop_type, group_prop_meta = find_group_property(schema, PROPERTY_NAME)
     title_prop = detect_title_prop(schema)
     section_prop = best_effort_section_prop(schema)
     order_prop = best_effort_order_prop(schema)
     sorts = resolve_sorts(order_prop, title_prop)
+
+    # Google Sheets információ
+    if is_sheets_enabled():
+        st.success("Google Sheets mentés: BEKAPCSOLVA (Resume + csoportlapok).")
+        st.caption("Futtatás közben csoportonként azonnal mentem a Google Sheet-be, és a 'Resume' lapra az állapotot is.")
+    else:
+        st.info("Google Sheets mentés: kikapcsolva. (Beállítható: GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT)")
 
     with st.expander("ℹ️ Használt mezők és rendezés", expanded=False):
         st.markdown(
@@ -887,6 +1034,9 @@ def main():
             """
         )
         st.caption(f"⏱️ Watchdog: AUTO_RERUN_SECONDS={AUTO_RERUN_SECONDS}, MAX_GROUPS_PER_RUN={MAX_GROUPS_PER_RUN}, AUTO_RESUME={AUTO_RESUME}")
+
+    # Ha van Sheets-ben Resume és nincs session resume, töltsük be
+    maybe_load_resume_from_sheets(dbid, group_prop_name)
 
     st.write("Adatok beolvasása…")
     groups_sorted, display_to_canon = collect_group_index(client, dbid, group_prop_name, group_prop_type, group_prop_meta)

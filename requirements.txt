@@ -4,3 +4,5 @@ pandas
 XlsxWriter
 openpyxl
 python-slugify
+gspread
+google-auth
