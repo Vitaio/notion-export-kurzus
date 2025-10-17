@@ -1,29 +1,40 @@
 
-# Notion export – v8 (Google Sheets realtime – opcionális)
+# 📦 Notion export – Kurzus (Streamlit, jelszóval)
 
-## Újdonságok
-- **Google Sheets** integráció (opcionális, gspread): futás közben **csoportonként azonnal** ment a megadott táblázatba.
-- A `Resume` munkalapra JSON formában menti az állapotot (groups/done/cache-meta), és **automatikusan be is tölti**, ha nincs session állapot.
-- A csoportok **külön munkalapokra** kerülnek (ugyanazzal a névvel, mint az XLSX-ben).
-- Minden korábbi funkció megmaradt: multiselect *Név (db)*, login után `st.rerun()`, progress, XLSX több munkalap, egybefűzött CSV, XlsxWriter→openpyxl fallback, folytatható export, watchdog.
+Ez egy egyszerű, jelszóval védett webapp a Notion adatbázisod (Database ID: `623b8b80decd4f24a77a52c0d1dfc6ae`) "Kurzus" oszlopa alapján történő exporthoz.
 
-## Beállítás (Streamlit secrets)
-- `NOTION_API_KEY` – kötelező
-- `NOTION_DATABASE_ID` – kötelező
-- `APP_PASSWORD` – kötelező
-- `NOTION_PROPERTY_NAME` – opcionális (alap: „Kurzus”)
+## Fájlok
+- `app.py` – Streamlit alkalmazás
+- `requirements.txt` – Python függőségek
 
-**Google Sheets (opcionális):**
-- `GOOGLE_SHEETS_SPREADSHEET_ID` – a cél spreadsheet azonosítója (URL-ből a /d/<ID>/ részt másold ki)
-- `GOOGLE_SERVICE_ACCOUNT` – a service account JSON tartalma **egészben**, stringként (idézőjelek, kulcsok, stb.)  
-  → Ezt a service account e-mail címével **megosztani** kell a spreadsheetet *Editor* jogosultsággal.
+## Helyi futtatás
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-**Watchdog:**
-- `AUTO_RERUN_SECONDS` – pl. 480 (8 perc)
-- `MAX_GROUPS_PER_RUN` – pl. 8
-- `AUTO_RESUME` – `true`/`false`
+export NOTION_API_KEY="secret_xxx"
+export NOTION_DATABASE_ID="623b8b80decd4f24a77a52c0d1dfc6ae"
+export APP_PASSWORD="valamiErősJelszó"
 
-## Használat
-- Letöltés (XLSX/CSV) közben a csoport adatai a Google Sheet **ugyanígy** íródnak ki.
-- Ha megszakad a futás: induláskor, ha a Sheets `Resume` lapon talál állapotot, **aut. betölti** és a „Folytatás most”-tal mehetsz tovább.
-- Egy csoport mindig **egyben kerül** a saját lapjára (ha újra futtatod ugyanazt a csoportot, a lapját **törlöm és újraírom** – így nincs duplikáció).
+streamlit run app.py
+```
+
+## Deploy – Streamlit Community Cloud
+1. Pushold a repo-t GitHubra (legalább: `app.py`, `requirements.txt`).
+2. Lépj be: https://share.streamlit.io → **Deploy a public app from GitHub**.
+3. App Settings → **Secrets**:
+   ```
+   NOTION_API_KEY = "secret_xxx"
+   NOTION_DATABASE_ID = "623b8b80decd4f24a77a52c0d1dfc6ae"
+   APP_PASSWORD = "valamiErősJelszó"
+   ```
+4. Deploy. A kapott URL nyilvános, de az alkalmazás **saját jelszóval** védett.
+
+> Ha privát hozzáférést akarsz az URL szintjén is, tedd Cloudflare Access / Google IAP mögé, vagy válaszd a „Deploy a private app in Snowflake” opciót (enterprise).
+
+## Megjelenítési átnevezések
+Az app a listában átnevezi a valós Notion-neveket:
+- `Üzleti Modellek` → **Milyen vállalkozást indíts**
+- `Marketing rendszerek` → **Ügyfélszerző marketing rendszerek**
+
+Szerkeszthető az `app.py` tetején a `DISPLAY_RENAMES` szótárban.
