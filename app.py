@@ -1,6 +1,6 @@
 
 # app.py
-# Streamlit + Notion export (resumable, progress, counts, disappearing login)
+# Streamlit + Notion export (resumable with cache, progress, counts, disappearing login)
 # Env/Secrets: NOTION_API_KEY, NOTION_DATABASE_ID, APP_PASSWORD, NOTION_PROPERTY_NAME (default: "Kurzus")
 
 import os, io, re, time, math, unicodedata, json
@@ -589,27 +589,41 @@ def sanitize_sheet_name(name: str) -> str:
     return name[:31] if len(name) > 31 else name
 
 # ----------------------------
-# Resumable export engine
+# Resumable export (with cached results)
 # ----------------------------
 def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: str):
     st.session_state["resume"] = {
-        "version": 1,
+        "version": 2,
         "mode": mode,
         "property_name": property_name,
         "dbid": dbid,
         "groups": groups_display,
         "done": [],
+        "cache": {},  # display_name -> {"rows": [...], "count": int, "ts": ...}
         "created_at": datetime.utcnow().isoformat()+"Z",
     }
 
 def get_resume():
-    return st.session_state.get("resume")
+    meta = st.session_state.get("resume")
+    # v1 kompatibilitás: ha nincs cache vagy done, pótoljuk
+    if meta and "cache" not in meta:
+        meta["cache"] = {}
+    if meta and "done" not in meta:
+        meta["done"] = []
+    return meta
+
+def _cache_put(meta: dict, display_name: str, rows: List[Dict[str,str]]):
+    meta["cache"][display_name] = {
+        "rows": rows,
+        "count": len(rows),
+        "ts": datetime.utcnow().isoformat()+"Z"
+    }
 
 def checkpoint_download_button(label="💾 Checkpoint letöltése"):
     meta = get_resume()
     if not meta:
         return
-    data = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
+    data = json.dumps(meta, ensure_ascii=False).encode("utf-8")
     st.download_button(label, data=data, file_name="notion_export_checkpoint.json", mime="application/json", use_container_width=True)
 
 def checkpoint_uploader(label="🔁 Checkpoint betöltése"):
@@ -620,6 +634,10 @@ def checkpoint_uploader(label="🔁 Checkpoint betöltése"):
             if not isinstance(meta, dict) or "mode" not in meta or "groups" not in meta:
                 st.error("Érvénytelen checkpoint fájl.")
             else:
+                if "cache" not in meta:  # backward compat
+                    meta["cache"] = {}
+                if "done" not in meta:
+                    meta["done"] = []
                 st.session_state["resume"] = meta
                 st.success("Checkpoint betöltve. Nyomd meg a 'Folytatás' gombot.")
         except Exception as e:
@@ -630,28 +648,36 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                    section_prop: Optional[str], order_prop: Optional[str],
                    sorts: List[Dict[str, Any]]) -> bytes:
     meta = get_resume()
+    if not meta:
+        st.error("Nincs mentett állapot. Indíts új exportot.")
+        st.stop()
     groups = meta["groups"]
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
 
     reporter = ProgressReporter(total_steps=len(remaining), title="XLSX export folyamatban… (folytatható)")
+
+    # 1) Csak a fennmaradó csoportokat dolgozzuk fel és töltjük a cache-be
+    for display_name in remaining:
+        canon = display_to_canon.get(display_name, {}).get("canonical", set())
+        rows: List[Dict[str,str]] = []
+        for cname in canon:
+            rows = collect_rows_for_group(
+                client, dbid, prop_name, prop_type, cname,
+                title_prop, section_prop, order_prop, sorts,
+                on_progress=lambda m: reporter.log(m)
+            )
+            if rows:
+                break
+        _cache_put(meta, display_name, rows)
+        meta["done"].append(display_name)
+        reporter.tick(f"{display_name} – {len(rows)} sor kész.")
+
+    # 2) Kimenet összeállítása: MINDEN csoport a cache-ből
     output = io.BytesIO()
     with _excel_writer(output) as writer:
-        all_for_final = []
-
         for display_name in groups:
-            canon = display_to_canon.get(display_name, {}).get("canonical", set())
-            rows: List[Dict[str,str]] = []
-            for cname in canon:
-                rows = collect_rows_for_group(client, dbid, prop_name, prop_type, cname, title_prop, section_prop, order_prop, sorts, on_progress=lambda m: reporter.log(m))
-                if rows:
-                    break
-            all_for_final.append((display_name, rows))
-            if display_name in remaining:
-                meta["done"].append(display_name)
-                reporter.tick(f"{display_name} – {len(rows)} sor kész.")
-
-        for display_name, rows in all_for_final:
+            rows = meta["cache"].get(display_name, {}).get("rows", [])
             df = pd.DataFrame(rows, columns=CSV_FIELDNAMES)
             sheet = sanitize_sheet_name(display_name) or "lap"
             base = sheet; i = 1
@@ -662,6 +688,7 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
 
     output.seek(0)
     reporter.finish(ok=True, msg="XLSX elkészült.")
+    # export vége után töröljük a mentést
     st.session_state.pop("resume", None)
     return output.read()
 
@@ -670,25 +697,37 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
                   section_prop: Optional[str], order_prop: Optional[str],
                   sorts: List[Dict[str, Any]]) -> bytes:
     meta = get_resume()
+    if not meta:
+        st.error("Nincs mentett állapot. Indíts új exportot.")
+        st.stop()
     groups = meta["groups"]
     done = set(meta.get("done", []))
     remaining = [g for g in groups if g not in done]
 
     reporter = ProgressReporter(total_steps=len(remaining), title="CSV (egybefűzött) export folyamatban… (folytatható)")
-    all_rows: List[Dict[str,str]] = []
 
-    for display_name in groups:
+    # 1) Feldolgozzuk a maradék csoportokat és cache-eljük
+    for display_name in remaining:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
         for cname in canon:
-            rows = collect_rows_for_group(client, dbid, prop_name, prop_type, cname, title_prop, section_prop, order_prop, sorts, on_progress=lambda m: reporter.log(m))
+            rows = collect_rows_for_group(
+                client, dbid, prop_name, prop_type, cname,
+                title_prop, section_prop, order_prop, sorts,
+                on_progress=lambda m: reporter.log(m)
+            )
             if rows:
                 break
+        _cache_put(meta, display_name, rows)
+        meta["done"].append(display_name)
+        reporter.tick(f"{display_name} – {len(rows)} sor hozzáadva.")
+
+    # 2) Összefűzés: a cache-ben levő összes csoport adata
+    all_rows: List[Dict[str,str]] = []
+    for display_name in groups:
+        rows = meta["cache"].get(display_name, {}).get("rows", [])
         for r in rows:
             r2 = dict(r); r2["csoport"] = display_name; all_rows.append(r2)
-        if display_name in remaining:
-            meta["done"].append(display_name)
-            reporter.tick(f"{display_name} – {len(rows)} sor hozzáadva.")
 
     buf = io.StringIO()
     pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
@@ -772,6 +811,7 @@ def main():
         st.markdown("#### Összes egy fájlban – Excel (több munkalap)")
         if st.button("⬇️ Letöltés (XLSX)"):
             groups_display = [name for (name,_,_) in groups_sorted]
+            st.session_state.pop("resume", None)  # új futam kezdete
             init_resume("xlsx", groups_display, group_prop_name, dbid)
             data = resumable_xlsx(
                 client, dbid, group_prop_name, group_prop_type,
@@ -790,6 +830,7 @@ def main():
         st.markdown("#### Összes egy fájlban – CSV (egybefűzve)")
         if st.button("⬇️ Letöltés (CSV)"):
             groups_display = [name for (name,_,_) in groups_sorted]
+            st.session_state.pop("resume", None)
             init_resume("csv", groups_display, group_prop_name, dbid)
             data = resumable_csv(
                 client, dbid, group_prop_name, group_prop_type,
