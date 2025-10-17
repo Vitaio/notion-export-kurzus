@@ -106,7 +106,7 @@ def backoff_retry(fn, max_tries=5, base=0.5, factor=2.0, **kwargs):
     while True:
         try:
             return fn(**kwargs)
-        except APIResponseError as e:
+        except Exception as e:
             attempt += 1
             if attempt >= max_tries:
                 raise
@@ -185,9 +185,6 @@ def property_options_map(prop_meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
 # Notion: oldal bejárás + property olvasás
 # ----------------------------
 
-def query_database_pages(client: Client, dbid: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return backoff_retry(client.databases.query, database_id=dbid, **payload)
-
 def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None) -> List[Dict[str, Any]]:
     pages = []
     cursor = None
@@ -199,7 +196,7 @@ def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None) -> Li
             payload["sorts"] = sorts
         if cursor:
             payload["start_cursor"] = cursor
-        resp = query_database_pages(client, dbid, payload)
+        resp = client.databases.query(database_id=dbid, **payload)
         pages.extend(resp.get("results", []))
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
@@ -274,8 +271,8 @@ def fetch_blocks(client: Client, block_id: str) -> List[Dict[str, Any]]:
     results = []
     cursor = None
     while True:
-        resp = backoff_retry(client.blocks.children.list, block_id=block_id, start_cursor=cursor) if cursor \
-            else backoff_retry(client.blocks.children.list, block_id=block_id)
+        resp = client.blocks.children.list(block_id=block_id, start_cursor=cursor) if cursor \
+            else client.blocks.children.list(block_id=block_id)
         results.extend(resp.get("results", []))
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
@@ -587,24 +584,43 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
     return rows
 
 # ----------------------------
+# Excel writer fallback
+# ----------------------------
+
+def _excel_writer(output_io):
+    # Próbáljuk az XlsxWriter-t, ha nincs, visszaesünk openpyxl-re
+    try:
+        import xlsxwriter  # noqa: F401
+        return pd.ExcelWriter(output_io, engine="xlsxwriter")
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            return pd.ExcelWriter(output_io, engine="openpyxl")
+        except Exception:
+            st.error("Hiányzik XLSX író motor: telepítsd az 'XlsxWriter' vagy 'openpyxl' csomagot.")
+            st.stop()
+
+# ----------------------------
 # Exportálók
 # ----------------------------
 
 def export_group_to_csv_bytes(rows: List[Dict[str,str]]) -> bytes:
+    import pandas as _pd
     buf = io.StringIO()
-    pd.DataFrame(rows, columns=CSV_FIELDNAMES).to_csv(buf, index=False)
+    _pd.DataFrame(rows, columns=CSV_FIELDNAMES).to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8-sig")
 
 def sanitize_sheet_name(name: str) -> str:
-    name = re.sub(r'[:\\/?*\[\]]', "_", name)
+    name = re.sub(r'[:\\/?*\\[\\]]', "_", name)
     return name[:31] if len(name) > 31 else name
 
 def export_all_to_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                        display_to_canon: Dict[str, Dict[str, Any]], groups_display: List[str],
                        title_prop: str, section_prop: Optional[str], order_prop: Optional[str],
                        sorts: List[Dict[str, Any]]) -> bytes:
+    import pandas as _pd
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with _excel_writer(output) as writer:
         for display_name in groups_display:
             canon = display_to_canon.get(display_name, {}).get("canonical", set())
             rows: List[Dict[str,str]] = []
@@ -612,11 +628,11 @@ def export_all_to_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str
                 rows = collect_rows_for_group(client, dbid, prop_name, prop_type, cname, title_prop, section_prop, order_prop, sorts)
                 if rows:
                     break
-            df = pd.DataFrame(rows, columns=CSV_FIELDNAMES)
+            df = _pd.DataFrame(rows, columns=CSV_FIELDNAMES)
             sheet = sanitize_sheet_name(display_name) or "lap"
             base = sheet
             i = 1
-            while sheet in writer.sheets:
+            while sheet in getattr(writer, "sheets", {}):
                 i += 1
                 sheet = sanitize_sheet_name(f"{base}_{i}")
             df.to_excel(writer, index=False, sheet_name=sheet)
@@ -627,6 +643,7 @@ def export_all_to_single_csv(client: Client, dbid: str, prop_name: str, prop_typ
                              display_to_canon: Dict[str, Dict[str, Any]], groups_display: List[str],
                              title_prop: str, section_prop: Optional[str], order_prop: Optional[str],
                              sorts: List[Dict[str, Any]]) -> bytes:
+    import pandas as _pd
     all_rows: List[Dict[str,str]] = []
     for display_name in groups_display:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
@@ -640,7 +657,7 @@ def export_all_to_single_csv(client: Client, dbid: str, prop_name: str, prop_typ
             r2["csoport"] = display_name
             all_rows.append(r2)
     buf = io.StringIO()
-    pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
+    _pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8-sig")
 
 # ----------------------------
@@ -676,7 +693,7 @@ def main():
 
     client = get_notion_client()
     dbid = get_database_id()
-    schema = get_db_schema(dbid)  # ⬅️ FIX: csak dbid megy a cache-be
+    schema = get_db_schema(dbid)  # cache-elt séma (hash-elhető paraméterrel)
 
     PROPERTY_NAME = get_property_name()
     group_prop_name, group_prop_type, group_prop_meta = find_group_property(schema, PROPERTY_NAME)
