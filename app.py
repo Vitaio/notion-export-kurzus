@@ -1,8 +1,7 @@
-# app.py
+# app.py (v6.1 hotfix)
 # Streamlit + Notion export (resumable, robust retries, tolerant to 403/404, progress, counts)
-# + Watchdog: auto-rerun after time/chunk to avoid platform timeouts (configurable via secrets)
-# Env/Secrets: NOTION_API_KEY, NOTION_DATABASE_ID, APP_PASSWORD, NOTION_PROPERTY_NAME (default: "Kurzus")
-#              AUTO_RERUN_SECONDS (default: 540), MAX_GROUPS_PER_RUN (default: 0=unlimited), AUTO_RESUME (true/false)
+# + Watchdog (auto-rerun) + multiselect label counts + login rerun
+# Fix: added collect_group_index to prevent NameError on login.
 
 import os, io, re, time, math, unicodedata, json, random
 from datetime import datetime
@@ -23,9 +22,6 @@ except Exception:
 from notion_client import Client
 from notion_client.errors import APIResponseError, HTTPResponseError
 
-# ----------------------------
-# UI helpers
-# ----------------------------
 class ProgressReporter:
     def __init__(self, total_steps: int, title: str):
         self.total = max(1, int(total_steps))
@@ -66,9 +62,6 @@ class ProgressReporter:
                 except Exception:
                     pass
 
-# ----------------------------
-# Config / constants
-# ----------------------------
 DEFAULT_PROPERTY_NAME = "Kurzus"
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 
@@ -86,16 +79,12 @@ LESSON_SECTION_KEYS = [
     "lecke tartalom", "lesson text"
 ]
 
-# Retry config
 RETRYABLE_STATUS = {409, 429, 500, 502, 503, 504}
 RETRY_MAX = 7
 RETRY_BASE = 0.7
 RETRY_FACTOR = 1.8
 RETRY_JITTER = (0.05, 0.35)
 
-# ----------------------------
-# Secrets/env
-# ----------------------------
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     if name in os.environ and os.environ.get(name):
         return os.environ.get(name)
@@ -116,11 +105,8 @@ def get_int_secret(name: str, default: int) -> int:
 
 AUTO_RERUN_SECONDS = get_int_secret("AUTO_RERUN_SECONDS", 540)  # 9 perc
 MAX_GROUPS_PER_RUN = get_int_secret("MAX_GROUPS_PER_RUN", 0)   # 0 = korlátlan
-AUTO_RESUME = get_bool_secret("AUTO_RESUME", False)            # automatikus folytatás rerun után
+AUTO_RESUME = get_bool_secret("AUTO_RESUME", False)            # watchdog után automatikus folytatás
 
-# ----------------------------
-# Caching / clients
-# ----------------------------
 @st.cache_resource
 def get_notion_client() -> Client:
     token = get_secret("NOTION_API_KEY")
@@ -146,11 +132,7 @@ def get_db_schema(dbid: str) -> Dict[str, Any]:
     client = get_notion_client()
     return client.databases.retrieve(database_id=dbid)
 
-# ----------------------------
-# Notion helpers (robust layer)
-# ----------------------------
 def _retry_sleep(e: Optional[HTTPResponseError], attempt: int):
-    # Retry-After header first
     if e is not None and getattr(e, "response", None) is not None:
         try:
             hdr = e.response.headers.get("Retry-After")
@@ -176,7 +158,6 @@ def notion_request(callable_fn, *, retry_label: str = ""):
                     st.write(f"⏳ Újrapróbálkozás ({attempt}/{RETRY_MAX}) – {retry_label} [HTTP {status}]")
                 _retry_sleep(e, attempt)
                 continue
-            # Non-retryable -> propagate (403/404, stb.)
             raise
         except APIResponseError as e:
             last_err = e
@@ -290,7 +271,6 @@ def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None, on_ba
             break
     return pages
 
-# Blocks -> Markdown with robust fetching
 def fetch_blocks(client: Client, block_id: str) -> List[Dict[str, Any]]:
     results = []
     cursor = None
@@ -304,7 +284,6 @@ def fetch_blocks(client: Client, block_id: str) -> List[Dict[str, Any]]:
         except HTTPResponseError as e:
             status = getattr(e, "status", None)
             if status in (403, 404):
-                # nincs jogosultság / törölt – térjünk vissza az addig gyűjtötttel
                 return results
             raise
         results.extend(resp.get("results", []))
@@ -542,62 +521,85 @@ def extract_property_as_string(page: Dict[str, Any], prop_name: Optional[str]) -
         return "".join(rt.get("plain_text","") for rt in arr)
     return ""
 
-def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type: str,
-                           canonical_name: str, title_prop: str, section_prop: Optional[str],
-                           order_prop: Optional[str], sorts: List[Dict[str, Any]],
-                           on_progress=None) -> List[Dict[str,str]]:
-    f = {"property": prop_name}
-    if prop_type == "select":
-        f["select"] = {"equals": canonical_name}
-    elif prop_type == "multi_select":
-        f["multi_select"] = {"contains": canonical_name}
-    elif prop_type == "status":
-        f["status"] = {"equals": canonical_name}
+# -------- HOTFIX: collect_group_index (was missing) --------
+def collect_group_index(client: Client, dbid: str, prop_name: str, prop_type: str, prop_meta: Dict[str, Any]) -> Tuple[List[Tuple[str,int,set]], Dict[str, Dict[str, Any]]]:
+    """
+    Visszaad:
+      - rendezett lista: [(display_name, darab, canonical_name_set), ...] (darab szerint csökkenő)
+      - display_to_canon: {display_name: {"canonical": {összes ismert alias}}}
+    """
+    def property_options_map(prop_meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        ptype = prop_meta.get("type")
+        m: Dict[str, Dict[str, Any]] = {}
+        if ptype in ("select","multi_select"):
+            for opt in prop_meta.get(ptype, {}).get("options", []):
+                m[opt["id"]] = {"name": opt.get("name","")}
+        elif ptype == "status":
+            for opt in prop_meta.get("status", {}).get("options", []):
+                m[opt["id"]] = {"name": opt.get("name","")}
+        return m
 
-    def _on_batch(batch_no, total_so_far):
-        if callable(on_progress):
-            try:
-                on_progress(f"„{canonical_name}” – {total_so_far} oldal beolvasva (batch {batch_no}).")
-            except Exception:
-                pass
+    id_to_opt = property_options_map(prop_meta)
+    counts_by_id = {oid: 0 for oid in id_to_opt.keys()}
+    seen_names_by_id = {oid: set() for oid in id_to_opt.keys()}
 
-    pages = list_all_pages(client, dbid, filter_obj={"and": [f]}, sorts=sorts, on_batch=_on_batch)
-    rows = []
+    pages = list_all_pages(client, dbid)
     for pg in pages:
-        oldal_cime = extract_title(pg, title_prop) if title_prop else ""
-        szakasz = extract_property_as_string(pg, section_prop) if section_prop else ""
-        sorszam = extract_property_as_string(pg, order_prop) if order_prop else ""
-        # Robust block fetch
-        try:
-            blocks = fetch_blocks_recursive(client, pg["id"])
-            md = blocks_to_md(blocks)
-            tartalom = select_video_or_lesson(md)
-        except HTTPResponseError as e:
-            code = getattr(e, "status", None)
-            if code in (403, 404):
-                if callable(on_progress):
-                    on_progress(f"⚠️ Kihagyva: nincs jogosultság vagy törölt oldal (HTTP {code}) – {oldal_cime}")
-                tartalom = ""  # continue without content
-            else:
-                raise
-        rows.append({
-            "oldal_cime": oldal_cime or "",
-            "szakasz": szakasz or "",
-            "sorszam": sorszam or "",
-            "tartalom": tartalom or ""
-        })
-    def _num(x):
-        try:
-            return float(str(x).replace(",", "."))
-        except Exception:
-            return math.inf
-    if order_prop:
-        rows.sort(key=lambda r: (_num(r["sorszam"]), r["oldal_cime"].lower()))
-    else:
-        rows.sort(key=lambda r: r["oldal_cime"].lower())
-    return rows
+        p = pg.get("properties", {}).get(prop_name)
+        if not p:
+            continue
+        if prop_type == "select":
+            sel = p.get("select")
+            if sel:
+                oid = sel.get("id")
+                nm = sel.get("name","")
+                if oid in counts_by_id:
+                    counts_by_id[oid] += 1
+                    if nm:
+                        seen_names_by_id[oid].add(nm)
+        elif prop_type == "multi_select":
+            arr = p.get("multi_select", [])
+            for sel in arr:
+                oid = sel.get("id")
+                nm = sel.get("name","")
+                if oid in counts_by_id:
+                    counts_by_id[oid] += 1
+                    if nm:
+                        seen_names_by_id[oid].add(nm)
+        elif prop_type == "status":
+            stt = p.get("status")
+            if stt:
+                oid = stt.get("id")
+                nm = stt.get("name","")
+                if oid in counts_by_id:
+                    counts_by_id[oid] += 1
+                    if nm:
+                        seen_names_by_id[oid].add(nm)
 
-# Excel writer fallback
+    display_to_canon: Dict[str, Dict[str, Any]] = {}
+    items = []
+
+    reverse_alias = {}
+    for src, dst in DISPLAY_RENAMES.items():
+        reverse_alias.setdefault(dst, set()).add(src)
+
+    for oid, meta in id_to_opt.items():
+        current_name = meta.get("name","")
+        display_name = DISPLAY_RENAMES.get(current_name, current_name)
+        canon = set()
+        canon.add(current_name)
+        canon.update(seen_names_by_id.get(oid, set()))
+        if display_name in reverse_alias:
+            canon.update(reverse_alias[display_name])
+        canon.add(display_name)
+        count = counts_by_id.get(oid, 0)
+        items.append((display_name, count, canon))
+        display_to_canon[display_name] = {"canonical": canon}
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items, display_to_canon
+# ----------------------------------------------------------
+
 def _excel_writer(output_io):
     try:
         import xlsxwriter  # noqa: F401
@@ -614,9 +616,6 @@ def sanitize_sheet_name(name: str) -> str:
     name = re.sub(r'[:\\/?*\\[\\]]', "_", name)
     return name[:31] if len(name) > 31 else name
 
-# ----------------------------
-# Resumable export (with cached results) + WATCHDOG
-# ----------------------------
 def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: str):
     st.session_state["resume"] = {
         "version": 4,
@@ -625,7 +624,7 @@ def init_resume(mode: str, groups_display: List[str], property_name: str, dbid: 
         "dbid": dbid,
         "groups": groups_display,
         "done": [],
-        "cache": {},  # display_name -> {"rows": [...], "count": int, "ts": ...}
+        "cache": {},
         "created_at": datetime.utcnow().isoformat()+"Z",
     }
 
@@ -668,19 +667,6 @@ def checkpoint_uploader(label="🔁 Checkpoint betöltése"):
         except Exception as e:
             st.error(f"Nem sikerült betölteni: {e}")
 
-def _watchdog_should_rerun(start_ts: float, processed: int) -> bool:
-    if MAX_GROUPS_PER_RUN and processed >= MAX_GROUPS_PER_RUN:
-        return True
-    if AUTO_RERUN_SECONDS and (time.time() - start_ts) >= AUTO_RERUN_SECONDS:
-        return True
-    return False
-
-def _trigger_auto_rerun():
-    if AUTO_RESUME:
-        st.session_state["auto_resume_pending"] = True
-    st.toast("⌛ Időkeret/kvóta elérés – automatikus folytatás…", icon="⏳")
-    st.rerun()
-
 def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                    display_to_canon: Dict[str, Dict[str, Any]], title_prop: str,
                    section_prop: Optional[str], order_prop: Optional[str],
@@ -697,7 +683,6 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
     start_ts = time.time()
     processed = 0
 
-    # 1) Csak a fennmaradó csoportokat dolgozzuk fel és töltjük a cache-be
     for display_name in remaining:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
@@ -714,12 +699,18 @@ def resumable_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
         processed += 1
         reporter.tick(f"{display_name} – {len(rows)} sor kész.")
 
-        # Watchdog: limit per run
-        if _watchdog_should_rerun(start_ts, processed):
+        if MAX_GROUPS_PER_RUN and processed >= MAX_GROUPS_PER_RUN:
             reporter.finish(ok=True, msg="Részfutam mentve, folytatás…")
-            _trigger_auto_rerun()
+            if AUTO_RESUME:
+                st.session_state["auto_resume_pending"] = True
+            st.rerun()
 
-    # 2) Kimenet összeállítása: MINDEN csoport a cache-ből
+        if AUTO_RERUN_SECONDS and (time.time() - start_ts) >= AUTO_RERUN_SECONDS:
+            reporter.finish(ok=True, msg="Időkeret elérve, folytatás…")
+            if AUTO_RESUME:
+                st.session_state["auto_resume_pending"] = True
+            st.rerun()
+
     output = io.BytesIO()
     with _excel_writer(output) as writer:
         for display_name in groups:
@@ -753,7 +744,6 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
     start_ts = time.time()
     processed = 0
 
-    # 1) Feldolgozzuk a maradék csoportokat és cache-eljük
     for display_name in remaining:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
@@ -770,12 +760,18 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
         processed += 1
         reporter.tick(f"{display_name} – {len(rows)} sor hozzáadva.")
 
-        # Watchdog: limit per run
-        if _watchdog_should_rerun(start_ts, processed):
+        if MAX_GROUPS_PER_RUN and processed >= MAX_GROUPS_PER_RUN:
             reporter.finish(ok=True, msg="Részfutam mentve, folytatás…")
-            _trigger_auto_rerun()
+            if AUTO_RESUME:
+                st.session_state["auto_resume_pending"] = True
+            st.rerun()
 
-    # 2) Összefűzés: a cache-ben levő összes csoport adata
+        if AUTO_RERUN_SECONDS and (time.time() - start_ts) >= AUTO_RERUN_SECONDS:
+            reporter.finish(ok=True, msg="Időkeret elérve, folytatás…")
+            if AUTO_RESUME:
+                st.session_state["auto_resume_pending"] = True
+            st.rerun()
+
     all_rows: List[Dict[str,str]] = []
     for display_name in groups:
         rows = meta["cache"].get(display_name, {}).get("rows", [])
@@ -788,9 +784,6 @@ def resumable_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
     st.session_state.pop("resume", None)
     return buf.getvalue().encode("utf-8-sig")
 
-# ----------------------------
-# UI + login
-# ----------------------------
 def require_login():
     app_pw = get_secret("APP_PASSWORD")
     if not app_pw:
@@ -865,7 +858,7 @@ def main():
         st.markdown("#### Összes egy fájlban – Excel (több munkalap)")
         if st.button("⬇️ Letöltés (XLSX)"):
             groups_display = [name for (name,_,_) in groups_sorted]
-            st.session_state.pop("resume", None)  # új futam kezdete
+            st.session_state.pop("resume", None)
             init_resume("xlsx", groups_display, group_prop_name, dbid)
             data = resumable_xlsx(
                 client, dbid, group_prop_name, group_prop_type,
@@ -957,7 +950,6 @@ def main():
         checkpoint_uploader("🔁 Checkpoint betöltése (JSON)")
 
     st.caption("© Notion → Export • Streamlit app")
-    st.caption("Watchdog opciók: AUTO_RERUN_SECONDS, MAX_GROUPS_PER_RUN, AUTO_RESUME")
 
 if __name__ == "__main__":
     main()

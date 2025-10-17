@@ -1,15 +1,9 @@
-# Notion export – v6 (watchdog + auto-rerun)
-
-- Multiselect: **Név (db)**
-- Login után `st.rerun()`
-- **Progress + státusz log**
-- **XLSX több munkalap** + **egybefűzött CSV**
-- **XlsxWriter → openpyxl fallback**
-- **Folytatható export** (kész csoportok cache-ből)
-- **Robusztus Notion hívások** (retry 429/5xx, 403/404 skip)
-- **Watchdog**: hosszú futásokkor automatikus részfutam + `st.rerun()`
-
-## Konfiguráció (Secrets)
-- `AUTO_RERUN_SECONDS` (alap: 540 = 9 perc)
-- `MAX_GROUPS_PER_RUN` (alap: 0 = nincs limit)
-- `AUTO_RESUME` (true/false; ha true, a rerun után automatikusan folytat)
+# Notion export – v6.1 (hotfix)
+- Név (db) multiselect, login után `st.rerun()`
+- Progress + státusz log
+- XLSX (több munkalap) + összefűzött CSV
+- XlsxWriter → openpyxl fallback
+- Folytatható export (cache + done lista)
+- Notion retry (429/5xx) + 403/404 skip
+- Watchdog (AUTO_RERUN_SECONDS / MAX_GROUPS_PER_RUN / AUTO_RESUME)
+- **Hotfix**: `collect_group_index` bekerült, így a belépés utáni NameError megszűnik.
