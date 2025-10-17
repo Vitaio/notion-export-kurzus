@@ -1,5 +1,5 @@
 # app.py
-# Streamlit + Notion exportáló app
+# Streamlit + Notion exportáló app (progress bar-ral)
 # - Belépés: APP_PASSWORD
 # - Notion: NOTION_API_KEY, NOTION_DATABASE_ID
 # - Csoportosító property: NOTION_PROPERTY_NAME (alapértelmezés: "Kurzus")
@@ -7,6 +7,7 @@
 #   1) Egyenkénti CSV export csoportonként
 #   2) Összes egy fájlban – Excel (XLSX, több munkalap)
 #   3) Összes egy fájlban – CSV (egybefűzve)
+#   4) Élő folyamatjelző (progress bar + státusz)
 
 import os
 import io
@@ -34,6 +35,51 @@ from notion_client.errors import APIResponseError
 
 
 # ----------------------------
+# Folyamatjelző
+# ----------------------------
+
+class ProgressReporter:
+    def __init__(self, total_steps: int, title: str):
+        self.total = max(1, int(total_steps))
+        self.step = 0
+        self.progress = st.progress(0)
+        try:
+            self.status = st.status(title, state="running", expanded=False)
+            self._ctx = self.status.__enter__()
+            self._uses_status = True
+        except Exception:
+            self._uses_status = False
+            st.write(f"**{title}**")
+        self._log = st.empty()
+
+    def log(self, msg: str):
+        if msg:
+            self._log.write(msg)
+
+    def tick(self, msg: str = ""):
+        self.step = min(self.total, self.step + 1)
+        pct = int(self.step * 100 / self.total)
+        self.progress.progress(pct)
+        if msg:
+            self.log(f"{pct}% – {msg}")
+
+    def finish(self, ok: bool = True, msg: str = ""):
+        if msg:
+            self.log(msg)
+        if self._uses_status:
+            try:
+                if ok:
+                    self.status.update(label="Kész", state="complete")
+                else:
+                    self.status.update(label="Hiba", state="error")
+            finally:
+                try:
+                    self.status.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+
+# ----------------------------
 # Beállítások és aliasok
 # ----------------------------
 
@@ -41,7 +87,6 @@ DEFAULT_PROPERTY_NAME = "Kurzus"
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 
 DISPLAY_RENAMES: Dict[str, str] = {
-    # UI-címkékhez átnevezés (csak megjelenítés, a szűrés marad a kanonikus neveken)
     "Üzleti Modellek": "Milyen vállalkozást indíts",
     "Marketing rendszerek": "Ügyfélszerző marketing rendszerek",
 }
@@ -91,7 +136,6 @@ def get_database_id() -> str:
         st.stop()
     return dbid
 
-# ⬇️ FIX: ne adjunk át Client-et cache-elt függvénynek
 @st.cache_data(ttl=120)
 def get_db_schema(dbid: str) -> Dict[str, Any]:
     client = get_notion_client()
@@ -106,7 +150,7 @@ def backoff_retry(fn, max_tries=5, base=0.5, factor=2.0, **kwargs):
     while True:
         try:
             return fn(**kwargs)
-        except Exception as e:
+        except APIResponseError as e:
             attempt += 1
             if attempt >= max_tries:
                 raise
@@ -185,9 +229,13 @@ def property_options_map(prop_meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
 # Notion: oldal bejárás + property olvasás
 # ----------------------------
 
-def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None) -> List[Dict[str, Any]]:
+def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None, on_batch=None) -> List[Dict[str, Any]]:
+    """
+    on_batch: opcionális callback(batch_count:int, total_so_far:int) minden lekérés után.
+    """
     pages = []
     cursor = None
+    batch = 0
     while True:
         payload = {}
         if filter_obj:
@@ -197,7 +245,14 @@ def list_all_pages(client: Client, dbid: str, filter_obj=None, sorts=None) -> Li
         if cursor:
             payload["start_cursor"] = cursor
         resp = client.databases.query(database_id=dbid, **payload)
-        pages.extend(resp.get("results", []))
+        chunk = resp.get("results", [])
+        pages.extend(chunk)
+        batch += 1
+        if callable(on_batch):
+            try:
+                on_batch(batch, len(pages))
+            except Exception:
+                pass
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
         else:
@@ -435,14 +490,12 @@ def _extract_section_by_h2(md: str, target_keys: List[str], stop_keys: Optional[
             break
     if target_idx is None:
         return ""
-
     start_pos = h2s[target_idx][0]
     end_pos = len(md)
     for j in range(target_idx+1, len(h2s)):
         if normalize(h2s[j][1]) in norm_stop:
             end_pos = h2s[j][0]
             break
-
     chunk = md[start_pos:end_pos]
     return chunk.strip()
 
@@ -551,9 +604,18 @@ def build_filter(prop_name: str, prop_type: str, name: str) -> Dict[str, Any]:
 
 def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type: str,
                            canonical_name: str, title_prop: str, section_prop: Optional[str],
-                           order_prop: Optional[str], sorts: List[Dict[str, Any]]) -> List[Dict[str,str]]:
+                           order_prop: Optional[str], sorts: List[Dict[str, Any]],
+                           on_progress=None) -> List[Dict[str,str]]:
     f = build_filter(prop_name, prop_type, canonical_name)
-    pages = list_all_pages(client, dbid, filter_obj={"and": [f]}, sorts=sorts)
+
+    def _on_batch(batch_no, total_so_far):
+        if callable(on_progress):
+            try:
+                on_progress(f"„{canonical_name}” – {total_so_far} oldal beolvasva (batch {batch_no}).")
+            except Exception:
+                pass
+
+    pages = list_all_pages(client, dbid, filter_obj={"and": [f]}, sorts=sorts, on_batch=_on_batch)
     rows = []
     for pg in pages:
         oldal_cime = extract_title(pg, title_prop) if title_prop else ""
@@ -588,7 +650,6 @@ def collect_rows_for_group(client: Client, dbid: str, prop_name: str, prop_type:
 # ----------------------------
 
 def _excel_writer(output_io):
-    # Próbáljuk az XlsxWriter-t, ha nincs, visszaesünk openpyxl-re
     try:
         import xlsxwriter  # noqa: F401
         return pd.ExcelWriter(output_io, engine="xlsxwriter")
@@ -605,59 +666,71 @@ def _excel_writer(output_io):
 # ----------------------------
 
 def export_group_to_csv_bytes(rows: List[Dict[str,str]]) -> bytes:
-    import pandas as _pd
     buf = io.StringIO()
-    _pd.DataFrame(rows, columns=CSV_FIELDNAMES).to_csv(buf, index=False)
+    pd.DataFrame(rows, columns=CSV_FIELDNAMES).to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8-sig")
 
 def sanitize_sheet_name(name: str) -> str:
-    name = re.sub(r'[:\\/?*\\[\\]]', "_", name)
+    name = re.sub(r'[:\\/?*\[\]]', "_", name)
     return name[:31] if len(name) > 31 else name
 
 def export_all_to_xlsx(client: Client, dbid: str, prop_name: str, prop_type: str,
                        display_to_canon: Dict[str, Dict[str, Any]], groups_display: List[str],
                        title_prop: str, section_prop: Optional[str], order_prop: Optional[str],
                        sorts: List[Dict[str, Any]]) -> bytes:
-    import pandas as _pd
+    reporter = ProgressReporter(total_steps=len(groups_display), title="XLSX export folyamatban…")
     output = io.BytesIO()
     with _excel_writer(output) as writer:
         for display_name in groups_display:
             canon = display_to_canon.get(display_name, {}).get("canonical", set())
             rows: List[Dict[str,str]] = []
+            last_msg = ""
             for cname in canon:
-                rows = collect_rows_for_group(client, dbid, prop_name, prop_type, cname, title_prop, section_prop, order_prop, sorts)
+                rows = collect_rows_for_group(
+                    client, dbid, prop_name, prop_type, cname,
+                    title_prop, section_prop, order_prop, sorts,
+                    on_progress=lambda m: reporter.log(m)
+                )
                 if rows:
+                    last_msg = f"{display_name} – {len(rows)} sor kész."
                     break
-            df = _pd.DataFrame(rows, columns=CSV_FIELDNAMES)
+            df = pd.DataFrame(rows, columns=CSV_FIELDNAMES)
             sheet = sanitize_sheet_name(display_name) or "lap"
-            base = sheet
-            i = 1
+            base = sheet; i = 1
             while sheet in getattr(writer, "sheets", {}):
                 i += 1
                 sheet = sanitize_sheet_name(f"{base}_{i}")
             df.to_excel(writer, index=False, sheet_name=sheet)
+            reporter.tick(last_msg or f"{display_name} – üres.")
     output.seek(0)
+    reporter.finish(ok=True, msg="XLSX elkészült.")
     return output.read()
 
 def export_all_to_single_csv(client: Client, dbid: str, prop_name: str, prop_type: str,
                              display_to_canon: Dict[str, Dict[str, Any]], groups_display: List[str],
                              title_prop: str, section_prop: Optional[str], order_prop: Optional[str],
                              sorts: List[Dict[str, Any]]) -> bytes:
-    import pandas as _pd
+    reporter = ProgressReporter(total_steps=len(groups_display), title="CSV (egybefűzött) export folyamatban…")
     all_rows: List[Dict[str,str]] = []
     for display_name in groups_display:
         canon = display_to_canon.get(display_name, {}).get("canonical", set())
         rows: List[Dict[str,str]] = []
+        last_msg = ""
         for cname in canon:
-            rows = collect_rows_for_group(client, dbid, prop_name, prop_type, cname, title_prop, section_prop, order_prop, sorts)
+            rows = collect_rows_for_group(
+                client, dbid, prop_name, prop_type, cname,
+                title_prop, section_prop, order_prop, sorts,
+                on_progress=lambda m: reporter.log(m)
+            )
             if rows:
+                last_msg = f"{display_name} – {len(rows)} sor kész."
                 break
         for r in rows:
-            r2 = dict(r)
-            r2["csoport"] = display_name
-            all_rows.append(r2)
+            r2 = dict(r); r2["csoport"] = display_name; all_rows.append(r2)
+        reporter.tick(last_msg or f"{display_name} – üres.")
     buf = io.StringIO()
-    _pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
+    pd.DataFrame(all_rows, columns=["csoport"] + CSV_FIELDNAMES).to_csv(buf, index=False)
+    reporter.finish(ok=True, msg="CSV elkészült.")
     return buf.getvalue().encode("utf-8-sig")
 
 # ----------------------------
@@ -693,7 +766,7 @@ def main():
 
     client = get_notion_client()
     dbid = get_database_id()
-    schema = get_db_schema(dbid)  # cache-elt séma (hash-elhető paraméterrel)
+    schema = get_db_schema(dbid)
 
     PROPERTY_NAME = get_property_name()
     group_prop_name, group_prop_type, group_prop_meta = find_group_property(schema, PROPERTY_NAME)
@@ -771,9 +844,15 @@ def main():
         for display_name in selected:
             canon = display_to_canon.get(display_name, {}).get("canonical", set())
             rows: List[Dict[str,str]] = []
+            last_msg = ""
             for cname in canon:
-                rows = collect_rows_for_group(client, dbid, group_prop_name, group_prop_type, cname, title_prop, section_prop, order_prop, sorts)
+                rows = collect_rows_for_group(
+                    client, dbid, group_prop_name, group_prop_type, cname,
+                    title_prop, section_prop, order_prop, sorts,
+                    on_progress=lambda m: st.write(m)
+                )
                 if rows:
+                    last_msg = f"{display_name} – {len(rows)} sor kész."
                     break
             csv_bytes = export_group_to_csv_bytes(rows)
             safe = slugify(display_name) or "export"
@@ -784,6 +863,8 @@ def main():
                 mime="text/csv",
                 use_container_width=True
             )
+            if last_msg:
+                st.caption(last_msg)
 
     st.divider()
     st.caption("© Notion → Export • Streamlit app")
