@@ -15,9 +15,14 @@ import streamlit as st
 from notion_client import Client
 from notion_client.errors import APIResponseError
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Page config
+# ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Notion export – Kurzus", page_icon="📦", layout="wide")
-PRIMARY = "#E9551C"
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Secrets → env bridge
+# ────────────────────────────────────────────────────────────────────────────────
 try:
     for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD", "NOTION_PROPERTY_NAME"):
         if k in st.secrets and not os.getenv(k):
@@ -25,6 +30,9 @@ try:
 except Exception:
     pass
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────────────────────────────────────
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
 DATABASE_ID    = os.getenv("NOTION_DATABASE_ID", "").strip()
 APP_PASSWORD   = os.getenv("APP_PASSWORD", "").strip()
@@ -37,6 +45,9 @@ DISPLAY_RENAMES: Dict[str, str] = {
 CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 EXPORTS_ROOT = "exports"
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Auth
+# ────────────────────────────────────────────────────────────────────────────────
 def need_auth() -> bool:
     if "authed" not in st.session_state:
         st.session_state.authed = False
@@ -55,6 +66,9 @@ def login_form() -> None:
             else:
                 st.error("Hibás jelszó.")
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Notion client + schema
+# ────────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_client() -> Client:
     if not NOTION_API_KEY:
@@ -133,9 +147,12 @@ def query_filtered_pages(filter_: Dict, sorts: Optional[List[Dict]] = None) -> L
         cursor = resp.get("next_cursor")
     return results
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────────────
 def _norm_key(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"\\s+", "", s or "").strip().lower()
+    return re.sub(r"\s+", "", s or "").strip().lower()
 
 def format_rich_text(rt_array: List[Dict]) -> str:
     out = []
@@ -209,7 +226,8 @@ def build_display_list() -> List[Tuple[str, int, Set[str]]]:
         (disp, int(meta["count"]), set(meta["canon"]))  # type: ignore
         for disp, meta in display_items.items()
     ]
-    items.sort(key=lambda x: (-x[1], x[0].lower()))
+    # belső sorrend marad, de a UI-ból kivesszük a "kicsiktől nagyig" feliratot
+    items.sort(key=lambda x: (x[0].lower()))
     return items
 
 def build_filter(ptype: str, name: str) -> Dict:
@@ -407,8 +425,8 @@ def fix_numbered_lists(md: str) -> str:
     lines = md.splitlines()
     out: List[str] = []
     in_code = False
-    fence_re = re.compile(r"^\\s*```")
-    num_re = re.compile(r"^(\\s*)(\\d+)\\.\\s+(.*)$")
+    fence_re = re.compile(r"^\s*```")
+    num_re = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
     counter_for_indent: Dict[int, int] = {}
     active_list_indent: Optional[int] = None
 
@@ -432,7 +450,7 @@ def fix_numbered_lists(md: str) -> str:
         else:
             active_list_indent = None; out.append(line)
 
-    return "\\n".join(out).strip()
+    return "\n".join(out).strip()
 
 def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     ptype = get_property_type()
@@ -471,22 +489,24 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     for r in rows: writer.writerow(r)
     return output.getvalue().encode("utf-8")
 
-# BULK ENGINE (per-run checkpoint + progress cards + auto-retry)
+# ────────────────────────────────────────────────────────────────────────────────
+# Bulk engine with progress cards + checkpoints
+# ────────────────────────────────────────────────────────────────────────────────
 def _slug(s: str) -> str:
     s = s.strip().lower()
-    s = re.sub(r"[^\w\\s-]", "", s, flags=re.UNICODE)
-    s = re.sub(r"[\\s-]+", "_", s)
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"[\s-]+", "_", s)
     return s[:80] if len(s) > 80 else s
 
 def _ensure_dir(p: str): os.makedirs(p, exist_ok=True)
-def _run_dir(run_id: str) -> str: return os.path.join("exports", f"run_{run_id}")
+def _run_dir(run_id: str) -> str: return os.path.join(EXPORTS_ROOT, f"run_{run_id}")
 def _checkpoint_path(run_id: str) -> str: return os.path.join(_run_dir(run_id), "checkpoint.json")
 
 def _append_log(run_id: str, msg: str):
     rd = _run_dir(run_id); _ensure_dir(rd)
     try:
         with open(os.path.join(rd, "run_log.txt"), "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\\n")
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
     except Exception:
         pass
 
@@ -515,7 +535,8 @@ def _zip_folder(folder: str) -> bytes:
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for root, _, files in os.walk(folder):
             for name in sorted(files):
-                if name.endswith(".json") or name.endswith(".txt"): continue
+                if name.endswith(".json") or name.endswith(".txt"):
+                    continue
                 fp = os.path.join(root, name)
                 arcname = os.path.relpath(fp, folder)
                 zf.write(fp, arcname)
@@ -529,12 +550,15 @@ def _retry_export_one(display_name: str, canon_set: Set[str], export_one_fn, run
             _append_log(run_id, f"START {display_name} (attempt {attempt}/{max_tries})")
             data = export_one_fn(display_name, canon_set)
             _append_log(run_id, f"SUCCESS {display_name}")
-            return data, attempt-1
+            return data, attempt-1  # hány újrapróba kellett
         except APIResponseError as e:
-            last_exc = e; _append_log(run_id, f"API ERROR {display_name}: {getattr(e, 'status', '?')} – {e!r}")
-            if getattr(e, "status", None) not in (429, 500, 502, 503): break
+            last_exc = e
+            _append_log(run_id, f"API ERROR {display_name}: {getattr(e, 'status', '?')} – {e!r}")
+            if getattr(e, "status", None) not in (429, 500, 502, 503):
+                break
         except Exception as e:
-            last_exc = e; _append_log(run_id, f"ERROR {display_name}: {e!r}")
+            last_exc = e
+            _append_log(run_id, f"ERROR {display_name}: {e!r}")
         time.sleep(2 ** (attempt - 1))
     _append_log(run_id, f"FINAL FAIL {display_name}: {last_exc!r}")
     return None, max_tries-1
@@ -542,25 +566,36 @@ def _retry_export_one(display_name: str, canon_set: Set[str], export_one_fn, run
 def _init_run(groups_display: List[Tuple[str,int,Set[str]]]):
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     rd = _run_dir(run_id); _ensure_dir(rd)
+    # sorrendet NEM kommunikáljuk; belsőleg maradhat a kicsiktől-nagyig vagy ABC – nem jelenítjük meg a szövegben
     ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
     state = {
         "run_id": run_id,
         "created_at": datetime.now().isoformat(),
-        "completed": [], "pending": [d for d, _, _ in ordered], "failed": [],
-        "retries": 0, "total": len(ordered), "eta_sec_per_item": None, "durations": []
+        "completed": [],
+        "pending": [d for d, _, _ in ordered],
+        "failed": [],
+        "retries": 0,
+        "total": len(ordered),
+        "eta_sec_per_item": None,
+        "durations": [],
     }
-    _save_checkpoint(run_id, state); _append_log(run_id, "=== ÚJ FUTÁS INDULT ===")
+    _save_checkpoint(run_id, state)
+    _append_log(run_id, "=== ÚJ FUTÁS INDULT ===")
     return run_id, state
 
 def _resume_or_new_run(groups_display: List[Tuple[str,int,Set[str]]]):
     run_id = st.session_state.get("current_run_id")
     if run_id:
         cp = _load_checkpoint(run_id)
-        if cp: return run_id, cp
+        if cp: 
+            return run_id, cp
     run_id, cp = _init_run(groups_display)
     st.session_state["current_run_id"] = run_id
     return run_id, cp
 
+# ────────────────────────────────────────────────────────────────────────────────
+# UI helpers: progress cards
+# ────────────────────────────────────────────────────────────────────────────────
 class ProgressUI:
     def __init__(self, run_id: str, ordered: List[Tuple[str,int,Set[str]]]):
         self.run_id = run_id
@@ -569,101 +604,160 @@ class ProgressUI:
         self.global_progress_placeholder = st.empty()
         self.eta_placeholder = st.empty()
         self.grid = st.container()
+
         cp = _load_checkpoint(run_id) or {}
-        completed = set(cp.get("completed", [])); failed = set(cp.get("failed", []))
+        completed = set(cp.get("completed", []))
+        failed = set(cp.get("failed", []))
+
         with self.grid:
             for name, count, _ in ordered:
                 ph = st.container(border=True)
                 with ph:
                     col1, col2 = st.columns([0.6, 0.4])
-                    with col1: st.markdown(f"**{name}**  \\n{count} oldal")
+                    with col1:
+                        # valódi sortörés: két space + newline
+                        st.markdown(f"**{name}**  \n{int(count)} oldal")
                     with col2:
-                        self.rows[name] = {"status": st.empty(), "pbar": st.progress(0.0), "note": st.empty()}
-                if name in completed: self.set_status(name, "done")
-                elif name in failed: self.set_status(name, "error")
-                else: self.set_status(name, "pending")
+                        self.rows[name] = {
+                            "status": st.empty(),
+                            "pbar": st.progress(0.0),
+                            "note": st.empty(),
+                        }
+                if name in completed:
+                    self.set_status(name, "done")
+                elif name in failed:
+                    self.set_status(name, "error")
+                else:
+                    self.set_status(name, "pending")
+
         self.update_global(cp)
 
     def set_status(self, name: str, status: str, note: str = ""):
         icons = {"done": "🟢 Kész", "running": "🟡 Folyamatban…", "error": "🔴 Hiba", "pending": "⚪ Várakozik"}
         row = self.rows[name]
         row["status"].markdown(f"**Állapot:** {icons.get(status, status)}")
-        if status == "running": row["pbar"].progress(0.3)
-        elif status == "done": row["pbar"].progress(1.0)
-        elif status == "error": row["pbar"].progress(0.0)
-        else: row["pbar"].progress(0.0)
-        if note: row["note"].write(note)
+        if status == "running":
+            row["pbar"].progress(0.3)
+        elif status == "done":
+            row["pbar"].progress(1.0)
+        elif status == "error":
+            row["pbar"].progress(0.0)
+        else:
+            row["pbar"].progress(0.0)
+        if note:
+            row["note"].write(note)
 
     def update_global(self, cp: dict):
-        total = cp.get("total", self.total); done = len(cp.get("completed", []))
-        failed = len(cp.get("failed", [])); retries = int(cp.get("retries", 0))
+        total = cp.get("total", self.total)
+        done = len(cp.get("completed", []))
+        failed = len(cp.get("failed", []))
+        retries = int(cp.get("retries", 0))
         pct = 0.0 if total == 0 else done / total
         self.global_progress_placeholder.progress(pct, text=f"Össz-progressz: {done}/{total} kész ({int(pct*100)}%)")
         eta_per = cp.get("eta_sec_per_item")
         if eta_per:
-            remaining = total - done; eta_sec = max(0, int(remaining * eta_per))
-            mins = eta_sec // 60; secs = eta_sec % 60
+            remaining = total - done
+            eta_sec = max(0, int(remaining * eta_per))
+            mins = eta_sec // 60
+            secs = eta_sec % 60
             self.eta_placeholder.info(f"**Előrehaladás összefoglaló:** {done}/{total} csoport exportálva ({int(pct*100)}%) — várható hátralévő idő: {mins} perc {secs:02d} mp | 🔁 újrapróbálások: {retries}")
         else:
             self.eta_placeholder.info(f"**Előrehaladás összefoglaló:** {done}/{total} csoport exportálva ({int(pct*100)}%) | 🔁 újrapróbálások: {retries}")
 
     def summary_box(self, cp: dict):
-        total = cp.get("total", self.total); done = len(cp.get("completed", []))
-        failed = len(cp.get("failed", [])); retries = int(cp.get("retries", 0))
+        total = cp.get("total", self.total)
+        done = len(cp.get("completed", []))
+        failed = len(cp.get("failed", []))
+        retries = int(cp.get("retries", 0))
         st.success(f"Összegzés: ✅ {done} sikeres, ⚠️ {failed} hiba, 🔁 {retries} újrapróbálás (összesen: {total})")
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Bulk export core
+# ────────────────────────────────────────────────────────────────────────────────
 def export_engine(run_id: str, groups_display: List[Tuple[str,int,Set[str]]]):
     ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
     cp = _load_checkpoint(run_id)
     if not cp:
-        cp = {"run_id": run_id, "created_at": datetime.now().isoformat(), "completed": [], "pending": [d for d,_,_ in ordered], "failed": [], "retries": 0, "total": len(ordered), "eta_sec_per_item": None, "durations": []}
+        cp = {
+            "run_id": run_id,
+            "created_at": datetime.now().isoformat(),
+            "completed": [],
+            "pending": [d for d,_,_ in ordered],
+            "failed": [],
+            "retries": 0,
+            "total": len(ordered),
+            "eta_sec_per_item": None,
+            "durations": []
+        }
         _save_checkpoint(run_id, cp)
+
     ui = ProgressUI(run_id, ordered)
 
     for name, count, canon in ordered:
         if name in cp["completed"]:
-            ui.set_status(name, "done"); continue
+            ui.set_status(name, "done")
+            continue
+
         ui.set_status(name, "running")
         t0 = time.time()
         data, retry_count = _retry_export_one(name, canon, export_one, run_id, max_tries=3)
         cp["retries"] = int(cp.get("retries", 0)) + retry_count
+
         if data is None:
-            cp["failed"] = sorted(set(cp.get("failed", []) | {name}))
+            # FIX: list -> set union
+            cp["failed"] = sorted(set(cp.get("failed", [])) | {name})
             _save_checkpoint(run_id, cp)
             ui.set_status(name, "error", note="Hibás export. Automatikus folytatás során újrapróbáljuk.")
             continue
+
         _write_csv_file(run_id, name, data)
         elapsed = max(0.1, time.time() - t0)
-        durs = cp.get("durations", []); durs.append(elapsed); 
-        if len(durs) > 10: durs = durs[-10:]
-        cp["durations"] = durs; cp["eta_sec_per_item"] = sum(durs) / len(durs)
-        cp["completed"] = sorted(set(cp.get("completed", []) | {name}))
-        if name in cp.get("failed", []): cp["failed"] = [x for x in cp["failed"] if x != name]
-        _save_checkpoint(run_id, cp)
-        ui.set_status(name, "done"); ui.update_global(cp)
+        durs = cp.get("durations", [])
+        durs.append(elapsed)
+        if len(durs) > 10:
+            durs = durs[-10:]
+        cp["durations"] = durs
+        cp["eta_sec_per_item"] = sum(durs) / len(durs)
 
-    done = len(cp.get("completed", [])); total = cp.get("total", len(ordered))
+        # FIX: list -> set union
+        cp["completed"] = sorted(set(cp.get("completed", [])) | {name})
+        if name in cp.get("failed", []):
+            cp["failed"] = [x for x in cp["failed"] if x != name]
+        _save_checkpoint(run_id, cp)
+
+        ui.set_status(name, "done")
+        ui.update_global(cp)
+
+    done = len(cp.get("completed", []))
+    total = cp.get("total", len(ordered))
     if done == total:
         zip_bytes = _zip_folder(_run_dir(run_id))
-        st.success("Export kész!"); ui.summary_box(cp)
+        st.success("Export kész!")
+        ui.summary_box(cp)
         st.download_button("ZIP letöltése", data=zip_bytes, file_name=f"notion_kurzus_export_{run_id}.zip", mime="application/zip")
         _append_log(run_id, "=== KÉSZ ===")
 
-# Main UI
+# ────────────────────────────────────────────────────────────────────────────────
+# UI – main
+# ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
 st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a „Videó szöveg”/„Lecke szöveg” H2 alatti rész; a számozott listák automatikusan 1., 2., 3.… formára újraszámozva.")
 
 if need_auth():
-    if not APP_PASSWORD: st.warning("Admin: állítsd be az APP_PASSWORD változót / Secrets-et a jelszóhoz.")
-    login_form(); st.stop()
+    if not APP_PASSWORD:
+        st.warning("Admin: állítsd be az APP_PASSWORD változót / Secrets-et a jelszóhoz.")
+    login_form()
+    st.stop()
 
 try:
     items = build_display_list()
 except Exception as e:
-    st.error(f"Hiba a Notion lekérésnél: {e}"); st.stop()
+    st.error(f"Hiba a Notion lekérésnél: {e}")
+    st.stop()
 
 if not items:
-    st.info("Nem találtam csoportokat a megadott PROPERTY_NAME alapján."); st.stop()
+    st.info("Nem találtam csoportokat a megadott PROPERTY_NAME alapján.")
+    st.stop()
 
 labels = [f"{name} ({cnt})" for name, cnt, _ in items]
 name_by_label = {f"{name} ({cnt})": name for name, cnt, _ in items}
@@ -697,32 +791,18 @@ if st.button("Exportálás (CSV)"):
             )
 
 st.markdown("---")
-st.subheader("Összes letöltése (ZIP) – legkisebbtől kezdve")
-colA, colB = st.columns([1,1])
-with colA:
-    start_run = st.button("Exportálás – Összes (kicsiktől nagyig)", type="primary", use_container_width=True)
-with colB:
-    reset = st.button("Újrakezdés (új run_id)", use_container_width=True)
-if reset:
-    st.session_state.pop("current_run_id", None); st.toast("Új futásra kész. Kattints az Exportálás gombra.")
+# Felirat módosítás: kivesszük a „legkisebbtől kezdve” szöveget
+st.subheader("Összes letöltése (ZIP)")
+start_run = st.button("Exportálás – Összes", type="primary", use_container_width=True)
 
-def run_export_background(run_id: str, groups_display: List[Tuple[str,int,Set[str]]]):
-    # Try some potential background APIs; fallback to inline.
-    for cand in ("experimental_background", "background"):
-        if hasattr(st, cand):
-            try:
-                getattr(st, cand)(export_engine, run_id, groups_display)
-                return True
-            except Exception:
-                pass
-    return False
+def _resume_or_render(run_id: Optional[str]):
+    if run_id and _load_checkpoint(run_id):
+        export_engine(run_id, items)
 
-run_id = st.session_state.get("current_run_id")
-if run_id and _load_checkpoint(run_id):
-    export_engine(run_id, items)
+# Auto-resume render (progress megőrzése újratöltéskor)
+_resume_or_render(st.session_state.get("current_run_id"))
 
 if start_run:
     run_id, cp = _resume_or_new_run(items)
     st.info(f"Futás azonosító: `{run_id}`")
-    started_bg = run_export_background(run_id, items)
     export_engine(run_id, items)
