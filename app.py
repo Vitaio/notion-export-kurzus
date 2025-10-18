@@ -23,7 +23,13 @@ st.set_page_config(page_title="Notion export – Kurzus", page_icon="📦", layo
 # Secrets → env bridge
 # ────────────────────────────────────────────────────────────────────────────────
 try:
-    for k in ("NOTION_API_KEY", "NOTION_DATABASE_ID", "APP_PASSWORD", "NOTION_PROPERTY_NAME"):
+    for k in (
+        "NOTION_API_KEY",
+        "NOTION_DATABASE_ID",
+        "APP_PASSWORD",
+        "NOTION_PROPERTY_NAME",
+        "MAX_CONTENT_CHARS",   # ÚJ
+    ):
         if k in st.secrets and not os.getenv(k):
             os.environ[k] = str(st.secrets[k])
 except Exception:
@@ -38,14 +44,18 @@ APP_PASSWORD   = os.getenv("APP_PASSWORD", "").strip()
 PROPERTY_NAME  = os.getenv("NOTION_PROPERTY_NAME", "Kurzus").strip()
 
 # max cella-hossz CSV-ben; felette tartalom_cont_X oszlopokba daraboljuk
-MAX_CONTENT_CHARS = int(os.getenv("MAX_CONTENT_CHARS", "40000"))
+def _parse_int(s: str, default: int) -> int:
+    try:
+        return int(str(s).strip())
+    except Exception:
+        return default
+MAX_CONTENT_CHARS = _parse_int(os.getenv("MAX_CONTENT_CHARS", "40000"), 40000)
 
 DISPLAY_RENAMES: Dict[str, str] = {
     "Üzleti Modellek": "Milyen vállalkozást indíts",
     "Marketing rendszerek": "Ügyfélszerző marketing rendszerek",
 }
-
-CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]  # per-kurzus CSV alap
+CSV_FIELDNAMES = ["oldal_cime", "szakasz", "sorszam", "tartalom"]
 EXPORTS_ROOT = "exports"
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -229,7 +239,7 @@ def build_display_list() -> List[Tuple[str, int, Set[str]]]:
         (disp, int(meta["count"]), set(meta["canon"]))  # type: ignore
         for disp, meta in display_items.items()
     ]
-    # UI-ban nem kommunikáljuk a belső sorrendet
+    # UI-ban ABC szerint (nem kommunikáljuk a belső sorrendet)
     items.sort(key=lambda x: (x[0].lower()))
     return items
 
@@ -416,18 +426,36 @@ def clean_markdown(md: str) -> str:
     """Kíméletes tisztítás: címsorok, idézetek, whitespace normalizálás, kódblokkok érintetlenek."""
     if not md:
         return ""
-    # ##Miért → ## Miért
-    md = re.sub(r"^(#+)([^\s#])", r"\1 \2", md, flags=re.M)
-    # headingek/idézetek előtt üres sor
-    md = re.sub(r"(\n#+\s)", r"\n\n\1", md)
-    md = re.sub(r"(\n>\s)",  r"\n\n\1", md)
-    # 3+ üres sor → 1 üres sor
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    # idézet-lista kisimítás (ha Notionból így jön)
-    md = re.sub(r"^>\s-\s", "- ", md, flags=re.M)
-    # felesleges formázások takarítása
-    md = md.replace("****", "")
+    md = re.sub(r"^(#+)([^\s#])", r"\1 \2", md, flags=re.M)     # ##Miért -> ## Miért
+    md = re.sub(r"(\n#+\s)", r"\n\n\1", md)                     # heading előtt üres sor
+    md = re.sub(r"(\n>\s)",  r"\n\n\1", md)                     # idézet előtt üres sor
+    md = re.sub(r"\n{3,}", "\n\n", md)                          # 3+ üres sor -> 1
+    md = re.sub(r"^>\s-\s", "- ", md, flags=re.M)               # > - minta kisimítása
+    md = md.replace("****", "")                                  # felesleges formázás
     return md.strip()
+
+def _split_h2_sections(md: str) -> Dict[str, List[str]]:
+    sections: Dict[str, List[str]] = {}
+    current = None
+    lines = md.splitlines()
+    for ln in lines:
+        if ln.startswith("## "):
+            current = ln[3:].strip()
+            sections[current] = []
+        else:
+            if current is not None:
+                sections[current].append(ln)
+    return sections
+
+def _join(lines: List[str]) -> str:
+    return "\n".join(lines).strip()
+
+def _normalize(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.strip().lower()
+    for ch in (" ", "_", "-", ".", ":"):
+        s = s.replace(ch, "")
+    return s
 
 def select_video_or_lesson_with_type(md: str) -> Tuple[str, Optional[str]]:
     """Visszaadja a kivágott szöveget és a típust: 'video_szoveg' / 'lecke_szoveg' / None."""
@@ -450,59 +478,44 @@ def select_video_or_lesson_with_type(md: str) -> Tuple[str, Optional[str]]:
         return lesson, "lecke_szoveg"
     return "", None
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Hosszú cella darabolás (CSV-hez)
-# ────────────────────────────────────────────────────────────────────────────────
-def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
-    """
-    A 'tartalom' mezőt több oszlopra vágja: tartalom, tartalom_cont_1, ...
-    Soft-split: lehetőleg \n\n határon vágunk; fallback a kemény vágás.
-    """
-    text = text or ""
-    if len(text) <= max_len:
-        return {"tartalom": text}
+def fix_numbered_lists(md: str) -> str:
+    lines = md.splitlines()
+    out: List[str] = []
+    in_code = False
+    fence_re = re.compile(r"^\s*```")
+    num_re = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
+    counter_for_indent: Dict[int, int] = {}
+    active_list_indent: Optional[int] = None
 
-    parts: List[str] = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + max_len, n)
-        # soft cut: keressük az utolsó dupla sortörést az ablak végéhez közel
-        window = text[start:end]
-        cut = window.rfind("\n\n")
-        if cut >= int(max_len * 0.6):  # ne vágjunk túl korán
-            end = start + cut
-        part = text[start:end].rstrip()
-        if part:
-            parts.append(part)
-        start = end
+    for line in lines:
+        if fence_re.match(line):
+            in_code = not in_code; out.append(line); continue
+        if in_code: out.append(line); continue
 
-    out: Dict[str, str] = {}
-    for i, p in enumerate(parts):
-        if i == 0:
-            out["tartalom"] = p
+        m = num_re.match(line)
+        if m:
+            indent_str = m.group(1); indent_len = len(indent_str); content = m.group(3)
+            if active_list_indent is None or indent_len != active_list_indent:
+                active_list_indent = indent_len
+                for k in list(counter_for_indent.keys()):
+                    if k >= indent_len: del counter_for_indent[k]
+                counter_for_indent[indent_len] = 1
+            else:
+                counter_for_indent[indent_len] = counter_for_indent.get(indent_len, 0) + 1
+            n = counter_for_indent[indent_len]
+            out.append(f"{indent_str}{n}. {content}")
         else:
-            out[f"tartalom_cont_{i}"] = p
-    return out
+            active_list_indent = None; out.append(line)
 
-def _max_cont_cols(rows: List[Dict[str, str]]) -> int:
-    """Visszaadja, hány tartalom_cont_X oszlopra van szükség maximum (X max értéke)."""
-    mx = 0
-    for r in rows:
-        for k in r.keys():
-            m = re.match(r"tartalom_cont_(\d+)$", k)
-            if m:
-                mx = max(mx, int(m.group(1)))
-    return mx
+    return "\n".join(out).strip()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Sorépítés – közös logika (dupla kód elkerülésére)
+# Közös építők – oldal → sor
 # ────────────────────────────────────────────────────────────────────────────────
 def _pages_for_group(display_name: str, canonical_names: Set[str]) -> List[Dict]:
-    """Lekéri az adott csoporthoz tartozó oldalakat a rendezési szabállyal."""
     ptype = get_property_type()
     section_prop, order_prop = resolve_section_and_order_props()
-    sorts, _sort_desc = resolve_sorts(order_prop)
+    sorts, _ = resolve_sorts(order_prop)
 
     pages: List[Dict] = []
     for nm in sorted(canonical_names, key=lambda s: (0 if s == display_name else 1, s)):
@@ -516,7 +529,6 @@ def _pages_for_group(display_name: str, canonical_names: Set[str]) -> List[Dict]
     return pages
 
 def _row_from_page(page: Dict) -> Tuple[Dict[str, str], Optional[str]]:
-    """Felépít egy alap sort egy Notion oldalból + visszaadja a section_type-ot (ha van)."""
     section_prop, order_prop = resolve_section_and_order_props()
     title = extract_title(page)
     section_val = format_property_for_csv(page, section_prop) if section_prop else ""
@@ -537,25 +549,61 @@ def _row_from_page(page: Dict) -> Tuple[Dict[str, str], Optional[str]]:
     return base, section_type
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Eredeti per-kurzus export (MEGMARAD) – kiegészítve clean+split-tel
+# Hosszú cella darabolás (CSV-hez)
+# ────────────────────────────────────────────────────────────────────────────────
+def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
+    text = text or ""
+    if len(text) <= max_len:
+        return {"tartalom": text}
+
+    parts: List[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + max_len, n)
+        window = text[start:end]
+        cut = window.rfind("\n\n")
+        if cut >= int(max_len * 0.6):
+            end = start + cut
+        part = text[start:end].rstrip()
+        if part:
+            parts.append(part)
+        start = end
+
+    out: Dict[str, str] = {}
+    for i, p in enumerate(parts):
+        if i == 0:
+            out["tartalom"] = p
+        else:
+            out[f"tartalom_cont_{i}"] = p
+    return out
+
+def _max_cont_cols(rows: List[Dict[str, str]]) -> int:
+    mx = 0
+    for r in rows:
+        for k in r.keys():
+            m = re.match(r"tartalom_cont_(\d+)$", k)
+            if m:
+                mx = max(mx, int(m.group(1)))
+    return mx
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Eredeti per-kurzus export (MEGMARAD)
 # ────────────────────────────────────────────────────────────────────────────────
 def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     pages = _pages_for_group(display_name, canonical_names)
 
-    # nincs oldal → üres táblázat az eredeti 4 fejléccel
     if not pages:
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         return output.getvalue().encode("utf-8")
 
-    # felépítjük a sorokat, clean + hosszú tartalom darabolása
     rows_base: List[Dict[str, str]] = []
     for pg in pages:
         base, _stype = _row_from_page(pg)
         rows_base.append(base)
 
-    # darabolás oszlopokba (csak ha kell)
     split_rows: List[Dict[str, str]] = []
     for r in rows_base:
         chunks = _split_content_for_csv(r.get("tartalom", ""), MAX_CONTENT_CHARS)
@@ -564,7 +612,6 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
         out.update(chunks)
         split_rows.append(out)
 
-    # fejléc: alap + annyi tartalom_cont_X, amennyit a legnagyobb sor igényel
     max_extra = _max_cont_cols(split_rows)
     fieldnames = ["oldal_cime", "szakasz", "sorszam", "tartalom"] + [f"tartalom_cont_{i}" for i in range(1, max_extra + 1)]
 
@@ -572,76 +619,21 @@ def export_one(display_name: str, canonical_names: Set[str]) -> bytes:
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     for r in split_rows:
-        # töltsük fel a hiányzó cont oszlopokat üressel
         for i in range(1, max_extra + 1):
             r.setdefault(f"tartalom_cont_{i}", "")
         writer.writerow(r)
     return output.getvalue().encode("utf-8")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# ÚJ: Összes – egy munkalap (CSV, Google Sheets-hez)
+# ÚJ: Összes – egy munkalap (CSV) robusztus motorral
+#   - checkpoint + automatikus folytatás
+#   - progress cardok
+#   - retry/backoff
+#   - végén 1 db CSV letöltés
 # ────────────────────────────────────────────────────────────────────────────────
-def export_unified_sheet(groups_display: List[Tuple[str,int,Set[str]]]) -> bytes:
-    """
-    Minden kurzus/csoport egyetlen táblába kerül.
-    Fejléc: course, oldal_cime, szakasz, sorszam, section_type, tartalom, tartalom_cont_X...
-    """
-    all_rows: List[Dict[str, str]] = []
-
-    for display_name, _count, canon in groups_display:
-        pages = _pages_for_group(display_name, canon)
-        if not pages:
-            continue
-        for pg in pages:
-            base, section_type = _row_from_page(pg)
-            # unified: tegyük be a 'course' és 'section_type' mezőt
-            row = {
-                "course": display_name,
-                "oldal_cime": base["oldal_cime"],
-                "szakasz": base["szakasz"],
-                "sorszam": base["sorszam"],
-                "section_type": section_type or "",
-                "tartalom": base["tartalom"],
-            }
-            # tartalom darabolása (ha hosszú)
-            chunks = _split_content_for_csv(row.get("tartalom", ""), MAX_CONTENT_CHARS)
-            row.pop("tartalom", None)
-            row.update(chunks)
-            all_rows.append(row)
-
-    # nincs adat → üres tábla alap fejléccel
-    if not all_rows:
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["course", "oldal_cime", "szakasz", "sorszam", "section_type", "tartalom"])
-        writer.writeheader()
-        return output.getvalue().encode("utf-8")
-
-    # mennyi tartalom_cont_X kell?
-    max_extra = _max_cont_cols(all_rows)
-    fieldnames = ["course", "oldal_cime", "szakasz", "sorszam", "section_type", "tartalom"] + [f"tartalom_cont_{i}" for i in range(1, max_extra + 1)]
-
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in all_rows:
-        for i in range(1, max_extra + 1):
-            r.setdefault(f"tartalom_cont_{i}", "")
-        writer.writerow(r)
-    return output.getvalue().encode("utf-8")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Bulk engine with progress cards + checkpoints
-# ────────────────────────────────────────────────────────────────────────────────
-def _slug(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
-    s = re.sub(r"[\s-]+", "_", s)
-    return s[:80] if len(s) > 80 else s
-
 def _ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 def _run_dir(run_id: str) -> str: return os.path.join(EXPORTS_ROOT, f"run_{run_id}")
 def _checkpoint_path(run_id: str) -> str: return os.path.join(_run_dir(run_id), "checkpoint.json")
-
 def _append_log(run_id: str, msg: str):
     rd = _run_dir(run_id); _ensure_dir(rd)
     try:
@@ -650,96 +642,108 @@ def _append_log(run_id: str, msg: str):
     except Exception:
         pass
 
-def _save_checkpoint(run_id: str, state: dict):
-    rd = _run_dir(run_id); _ensure_dir(rd)
-    with open(_checkpoint_path(run_id), "w", encoding="utf-8") as f:
+# Unified specific paths
+def _unified_paths(run_id: str) -> Dict[str, str]:
+    rd = _run_dir(run_id)
+    return {
+        "rows_ndjson": os.path.join(rd, "unified_rows.ndjson"),
+        "csv_out": os.path.join(rd, f"Content_egylap_{run_id}.csv"),
+        "checkpoint": os.path.join(rd, "unified_checkpoint.json"),
+    }
+
+def _save_unified_cp(run_id: str, state: dict):
+    _ensure_dir(_run_dir(run_id))
+    with open(_unified_paths(run_id)["checkpoint"], "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def _load_checkpoint(run_id: str) -> Optional[dict]:
+def _load_unified_cp(run_id: str) -> Optional[dict]:
     try:
-        with open(_checkpoint_path(run_id), "r", encoding="utf-8") as f:
+        with open(_unified_paths(run_id)["checkpoint"], "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
-def _write_csv_file(run_id: str, display_name: str, data: bytes) -> str:
-    rd = _run_dir(run_id); _ensure_dir(rd)
-    fn = f"export_{_slug(display_name)}.csv"
-    fp = os.path.join(rd, fn)
-    with open(fp, "wb") as f:
+def _append_unified_rows(run_id: str, rows: List[Dict[str, str]]) -> int:
+    """Sorokat írunk NDJSON-ba (soronként 1 JSON). Visszatér: írt sorok száma."""
+    p = _unified_paths(run_id)["rows_ndjson"]
+    _ensure_dir(os.path.dirname(p))
+    with open(p, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return len(rows)
+
+def _finalize_unified_csv(run_id: str) -> bytes:
+    """NDJSON → CSV (fejléc dinamikusan: tartalom_cont_X max alapján)"""
+    paths = _unified_paths(run_id)
+    nd = paths["rows_ndjson"]
+    if not os.path.exists(nd):
+        return b""
+
+    max_extra = 0
+    rows: List[Dict[str, str]] = []
+    with open(nd, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip(): continue
+            obj = json.loads(line)
+            rows.append(obj)
+            for k in obj.keys():
+                m = re.match(r"tartalom_cont_(\d+)$", k)
+                if m:
+                    max_extra = max(max_extra, int(m.group(1)))
+
+    fieldnames = ["course", "oldal_cime", "szakasz", "sorszam", "section_type", "tartalom"] + [f"tartalom_cont_{i}" for i in range(1, max_extra + 1)]
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        for i in range(1, max_extra + 1):
+            r.setdefault(f"tartalom_cont_{i}", "")
+        w.writerow(r)
+    data = out.getvalue().encode("utf-8")
+
+    # írjuk fájlba is (stabilitás/újraleszedés)
+    with open(paths["csv_out"], "wb") as f:
         f.write(data)
-    return fp
+    return data
 
-def _zip_folder(folder: str) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(folder):
-            for name in sorted(files):
-                if name.endswith(".json") or name.endswith(".txt"):
-                    continue
-                fp = os.path.join(root, name)
-                arcname = os.path.relpath(fp, folder)
-                zf.write(fp, arcname)
-    buf.seek(0)
-    return buf.read()
-
-def _retry_export_one(display_name: str, canon_set: Set[str], export_one_fn, run_id: str, max_tries: int = 3):
+def _retry_build_rows(display_name: str, canon: Set[str], max_tries: int = 3) -> Tuple[List[Dict[str, str]], int]:
+    """Felépíti a unified sorokat egy kurzushoz. Visszaad: sorok, újrapróbálások száma."""
     last_exc = None
     for attempt in range(1, max_tries + 1):
         try:
-            _append_log(run_id, f"START {display_name} (attempt {attempt}/{max_tries})")
-            data = export_one_fn(display_name, canon_set)
-            _append_log(run_id, f"SUCCESS {display_name}")
-            return data, attempt-1  # hány újrapróba kellett
+            rows: List[Dict[str, str]] = []
+            pages = _pages_for_group(display_name, canon)
+            for pg in pages:
+                base, section_type = _row_from_page(pg)
+                row = {
+                    "course": display_name,
+                    "oldal_cime": base["oldal_cime"],
+                    "szakasz": base["szakasz"],
+                    "sorszam": base["sorszam"],
+                    "section_type": section_type or "",
+                    "tartalom": base["tartalom"],
+                }
+                chunks = _split_content_for_csv(row.get("tartalom", ""), MAX_CONTENT_CHARS)
+                row.pop("tartalom", None)
+                row.update(chunks)
+                rows.append(row)
+            return rows, (attempt - 1)
         except APIResponseError as e:
             last_exc = e
-            _append_log(run_id, f"API ERROR {display_name}: {getattr(e, 'status', '?')} – {e!r}")
             if getattr(e, "status", None) not in (429, 500, 502, 503):
                 break
         except Exception as e:
             last_exc = e
-            _append_log(run_id, f"ERROR {display_name}: {e!r}")
         time.sleep(2 ** (attempt - 1))
-    _append_log(run_id, f"FINAL FAIL {display_name}: {last_exc!r}")
-    return None, max_tries-1
+    # hiba: üres listával térünk vissza
+    return [], (max_tries - 1)
 
-def _init_run(groups_display: List[Tuple[str,int,Set[str]]]):
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rd = _run_dir(run_id); _ensure_dir(rd)
-    ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
-    state = {
-        "run_id": run_id,
-        "created_at": datetime.now().isoformat(),
-        "completed": [],
-        "pending": [d for d, _, _ in ordered],
-        "failed": [],
-        "retries": 0,
-        "total": len(ordered),
-        "eta_sec_per_item": None,
-        "durations": [],
-    }
-    _save_checkpoint(run_id, state)
-    _append_log(run_id, "=== ÚJ FUTÁS INDULT ===")
-    return run_id, state
-
-def _resume_or_new_run(groups_display: List[Tuple[str,int,Set[str]]]):
-    run_id = st.session_state.get("current_run_id")
-    if run_id:
-        cp = _load_checkpoint(run_id)
-        if cp: 
-            return run_id, cp
-    run_id, cp = _init_run(groups_display)
-    st.session_state["current_run_id"] = run_id
-    return run_id, cp
-
-# ────────────────────────────────────────────────────────────────────────────────
-# UI helpers: progress cards
-# ────────────────────────────────────────────────────────────────────────────────
 class ProgressUI:
-    def __init__(self, run_id: str, ordered: List[Tuple[str,int,Set[str]]]):
+    def __init__(self, run_id: str, ordered: List[Tuple[str,int,Set[str]]], title: str):
         self.run_id = run_id
         self.total = len(ordered)
         self.rows = {}
+        st.markdown(f"### {title}")
         self.global_progress_placeholder = st.empty()
         self.eta_placeholder = st.empty()
         self.grid = st.container()
@@ -788,7 +792,6 @@ class ProgressUI:
     def update_global(self, cp: dict):
         total = cp.get("total", self.total)
         done = len(cp.get("completed", []))
-        failed = len(cp.get("failed", []))
         retries = int(cp.get("retries", 0))
         pct = 0.0 if total == 0 else done / total
         self.global_progress_placeholder.progress(pct, text=f"Össz-progressz: {done}/{total} kész ({int(pct*100)}%)")
@@ -798,20 +801,109 @@ class ProgressUI:
             eta_sec = max(0, int(remaining * eta_per))
             mins = eta_sec // 60
             secs = eta_sec % 60
-            self.eta_placeholder.info(f"**Előrehaladás összefoglaló:** {done}/{total} csoport exportálva ({int(pct*100)}%) — várható hátralévő idő: {mins} perc {secs:02d} mp | 🔁 újrapróbálások: {retries}")
+            self.eta_placeholder.info(f"**Előrehaladás:** {done}/{total} csoport ({int(pct*100)}%) — várható hátralévő idő: {mins} perc {secs:02d} mp | 🔁 újrapróbálások: {retries}")
         else:
-            self.eta_placeholder.info(f"**Előrehaladás összefoglaló:** {done}/{total} csoport exportálva ({int(pct*100)}%) | 🔁 újrapróbálások: {retries}")
+            self.eta_placeholder.info(f"**Előrehaladás:** {done}/{total} csoport ({int(pct*100)}%) | 🔁 újrapróbálások: {retries}")
 
-    def summary_box(self, cp: dict):
+    def summary_box(self, cp: dict, extra: Optional[str] = None):
         total = cp.get("total", self.total)
         done = len(cp.get("completed", []))
         failed = len(cp.get("failed", []))
         retries = int(cp.get("retries", 0))
-        st.success(f"Összegzés: ✅ {done} sikeres, ⚠️ {failed} hiba, 🔁 {retries} újrapróbálás (összesen: {total})")
+        txt = f"Összegzés: ✅ {done} sikeres, ⚠️ {failed} hiba, 🔁 {retries} újrapróbálás (összesen: {total})"
+        if extra:
+            txt += f"\n\n{extra}"
+        st.success(txt)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Bulk export core
-# ────────────────────────────────────────────────────────────────────────────────
+# Eredeti ZIP-es motor (meglévő)
+def _slug(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"[\s-]+", "_", s)
+    return s[:80] if len(s) > 80 else s
+
+def _zip_folder(folder: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(folder):
+            for name in sorted(files):
+                if name.endswith(".json") or name.endswith(".txt"):
+                    continue
+                fp = os.path.join(root, name)
+                arcname = os.path.relpath(fp, folder)
+                zf.write(fp, arcname)
+    buf.seek(0)
+    return buf.read()
+
+def _write_csv_file(run_id: str, display_name: str, data: bytes) -> str:
+    rd = _run_dir(run_id); _ensure_dir(rd)
+    fn = f"export_{_slug(display_name)}.csv"
+    fp = os.path.join(rd, fn)
+    with open(fp, "wb") as f:
+        f.write(data)
+    return fp
+
+def _save_checkpoint(run_id: str, state: dict):
+    rd = _run_dir(run_id); _ensure_dir(rd)
+    with open(_checkpoint_path(run_id), "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def _load_checkpoint(run_id: str) -> Optional[dict]:
+    try:
+        with open(_checkpoint_path(run_id), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _retry_export_one(display_name: str, canon_set: Set[str], export_one_fn, run_id: str, max_tries: int = 3):
+    last_exc = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            _append_log(run_id, f"START {display_name} (attempt {attempt}/{max_tries})")
+            data = export_one_fn(display_name, canon_set)
+            _append_log(run_id, f"SUCCESS {display_name}")
+            return data, attempt-1
+        except APIResponseError as e:
+            last_exc = e
+            _append_log(run_id, f"API ERROR {display_name}: {getattr(e, 'status', '?')} – {e!r}")
+            if getattr(e, "status", None) not in (429, 500, 502, 503):
+                break
+        except Exception as e:
+            last_exc = e
+            _append_log(run_id, f"ERROR {display_name}: {e!r}")
+        time.sleep(2 ** (attempt - 1))
+    _append_log(run_id, f"FINAL FAIL {display_name}: {last_exc!r}")
+    return None, max_tries-1
+
+def _init_run(groups_display: List[Tuple[str,int,Set[str]]]):
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rd = _run_dir(run_id); _ensure_dir(rd)
+    ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
+    state = {
+        "run_id": run_id,
+        "created_at": datetime.now().isoformat(),
+        "completed": [],
+        "pending": [d for d, _, _ in ordered],
+        "failed": [],
+        "retries": 0,
+        "total": len(ordered),
+        "eta_sec_per_item": None,
+        "durations": [],
+    }
+    _save_checkpoint(run_id, state)
+    _append_log(run_id, "=== ÚJ FUTÁS INDULT ===")
+    return run_id, state
+
+def _resume_or_new_run(groups_display: List[Tuple[str,int,Set[str]]]):
+    run_id = st.session_state.get("current_run_id")
+    if run_id:
+        cp = _load_checkpoint(run_id)
+        if cp: 
+            return run_id, cp
+    run_id, cp = _init_run(groups_display)
+    st.session_state["current_run_id"] = run_id
+    return run_id, cp
+
 def export_engine(run_id: str, groups_display: List[Tuple[str,int,Set[str]]]):
     ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
     cp = _load_checkpoint(run_id)
@@ -829,7 +921,7 @@ def export_engine(run_id: str, groups_display: List[Tuple[str,int,Set[str]]]):
         }
         _save_checkpoint(run_id, cp)
 
-    ui = ProgressUI(run_id, ordered)
+    ui = ProgressUI(run_id, ordered, title="Külön CSV-k (ZIP) – folyamat")
 
     for name, count, canon in ordered:
         if name in cp["completed"]:
@@ -873,11 +965,110 @@ def export_engine(run_id: str, groups_display: List[Tuple[str,int,Set[str]]]):
         st.download_button("ZIP letöltése", data=zip_bytes, file_name=f"notion_kurzus_export_{run_id}.zip", mime="application/zip")
         _append_log(run_id, "=== KÉSZ ===")
 
+# Unified run init/resume
+def _init_unified_run(groups_display: List[Tuple[str,int,Set[str]]]):
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
+    state = {
+        "run_id": run_id,
+        "created_at": datetime.now().isoformat(),
+        "groups": [d for d,_,_ in ordered],
+        "completed": [],
+        "failed": [],
+        "retries": 0,
+        "total": len(ordered),
+        "rows_written": 0,
+        "eta_sec_per_item": None,   # per group ETA
+        "durations": [],
+    }
+    _save_unified_cp(run_id, state)
+    # üresítsük az NDJSON-t
+    p = _unified_paths(run_id)["rows_ndjson"]
+    _ensure_dir(os.path.dirname(p))
+    open(p, "w", encoding="utf-8").close()
+    st.session_state["unified_run_id"] = run_id
+    return run_id, state
+
+def _resume_or_new_unified(groups_display: List[Tuple[str,int,Set[str]]]):
+    run_id = st.session_state.get("unified_run_id")
+    if run_id:
+        cp = _load_unified_cp(run_id)
+        if cp:
+            return run_id, cp
+    return _init_unified_run(groups_display)
+
+def unified_export_engine(run_id: str, groups_display: List[Tuple[str,int,Set[str]]]):
+    ordered = sorted(groups_display, key=lambda t: (t[1], t[0]))
+    cp = _load_unified_cp(run_id)
+    if not cp:
+        # ha checkpoint hiányzik (pl. törölt fájl), újraindítjuk
+        run_id, cp = _init_unified_run(groups_display)
+
+    ui = ProgressUI(run_id, ordered, title="Egy munkalap (CSV) – folyamat")
+
+    completed_set = set(cp.get("completed", []))
+    failed_set = set(cp.get("failed", []))
+
+    for name, count, canon in ordered:
+        if name in completed_set:
+            ui.set_status(name, "done")
+            continue
+        if name in failed_set:
+            ui.set_status(name, "error")
+            continue
+
+        ui.set_status(name, "running")
+        t0 = time.time()
+        rows, retry_count = _retry_build_rows(name, canon, max_tries=3)
+        cp["retries"] = int(cp.get("retries", 0)) + retry_count
+
+        if not rows:
+            # jelöljük hibásnak, de megyünk tovább
+            cp["failed"] = sorted(set(cp.get("failed", [])) | {name})
+            _save_unified_cp(run_id, cp)
+            ui.set_status(name, "error", note="Hiba történt, később újrapróbálható.")
+            continue
+
+        # kiírás NDJSON-ba
+        written = _append_unified_rows(run_id, rows)
+        cp["rows_written"] = int(cp.get("rows_written", 0)) + written
+
+        # ETA frissítés (mozgó átlag az utolsó 10 csoportból)
+        elapsed = max(0.1, time.time() - t0)
+        durs = list(cp.get("durations", []))
+        durs.append(elapsed)
+        if len(durs) > 10:
+            durs = durs[-10:]
+        cp["durations"] = durs
+        cp["eta_sec_per_item"] = sum(durs) / len(durs)
+
+        # kész
+        cp["completed"] = sorted(set(cp.get("completed", [])) | {name})
+        if name in cp.get("failed", []):
+            cp["failed"] = [x for x in cp["failed"] if x != name]
+        _save_unified_cp(run_id, cp)
+
+        ui.set_status(name, "done")
+        ui.update_global(cp)
+
+    done = len(cp.get("completed", []))
+    total = cp.get("total", len(ordered))
+    if done == total:
+        data = _finalize_unified_csv(run_id)
+        extra = f"Összes előállított sor: {cp.get('rows_written', 0)}"
+        ui.summary_box(cp, extra=extra)
+        filename = f"Content_egylap_{run_id}.csv"
+        st.download_button("Letöltés: " + filename, data=data, file_name=filename, mime="text/csv")
+
 # ────────────────────────────────────────────────────────────────────────────────
-# UI – main
+# UI – main (tabokba rendezve a letöltéseket)
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("📦 Notion export – Kurzus")
-st.caption("Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a „Videó szöveg”/„Lecke szöveg” H2 alatti rész; a számozott listák automatikusan 1., 2., 3.… formára újraszámozva. Hosszú cellák 40 000+ karakternél további oszlopokba törve.")
+st.caption(
+    "Rendezés: Sorszám ↑, különben ABC cím ↑. A „tartalom” a „Videó szöveg”/„Lecke szöveg” H2 alatti rész; "
+    "a számozott listák automatikusan 1., 2., 3.… formára újraszámozva. Hosszú cellák 40 000+ karakternél "
+    "további oszlopokba törve (tartalom_cont_n)."
+)
 
 if need_auth():
     if not APP_PASSWORD:
@@ -908,51 +1099,54 @@ with st.expander("Részletek (felismert mezők és rendezés)"):
     st.write(f"**Szakasz mező**: `{sec_prop or '— (nem találtam; üres lesz a CSV-ben)'}`")
     st.write(f"**Sorszám mező**: `{ord_prop or '— (nincs; ABC cím szerint rendezünk)'}`")
     st.write(f"**Rendezés**: {sorts_desc}")
+    st.write(f"**MAX_CONTENT_CHARS**: `{MAX_CONTENT_CHARS}`")
 
-# Egyenkénti export (változatlan viselkedés, tisztítás + hosszú cella vágás hozzáadva)
-pick = st.multiselect("Válaszd ki, mit exportáljunk (egyenkénti letöltés):", labels, max_selections=None)
-if st.button("Exportálás (CSV)"):
-    if not pick:
-        st.warning("Válassz legalább egy elemet.")
-    else:
-        for lbl in pick:
-            name = name_by_label[lbl]
-            data = export_one(name, canon_by_name[name])
-            fname_safe = re.sub(r"[^\w\-. ]", "_", name).strip().replace(" ", "_")
-            st.download_button(
-                label=f"Letöltés: {name}.csv",
-                data=data,
-                file_name=f"export_Kurzus_{fname_safe}.csv",
-                mime="text/csv",
-                key=f"dl-{fname_safe}",
-            )
+tab1, tab2 = st.tabs(["Külön CSV-k (ZIP)", "Egy munkalap (CSV)"])
 
-st.markdown("---")
-# Összes (ZIP) – megmarad
-st.subheader("Összes letöltése (ZIP)")
-start_run = st.button("Exportálás – Összes", type="primary", use_container_width=True)
+with tab1:
+    pick = st.multiselect("Válaszd ki, mit exportáljunk (egyenkénti letöltés):", labels, max_selections=None)
+    if st.button("Exportálás (CSV)"):
+        if not pick:
+            st.warning("Válassz legalább egy elemet.")
+        else:
+            for lbl in pick:
+                name = name_by_label[lbl]
+                data = export_one(name, canon_by_name[name])
+                fname_safe = re.sub(r"[^\w\-. ]", "_", name).strip().replace(" ", "_")
+                st.download_button(
+                    label=f"Letöltés: {name}.csv",
+                    data=data,
+                    file_name=f"export_Kurzus_{fname_safe}.csv",
+                    mime="text/csv",
+                    key=f"dl-{fname_safe}",
+                )
 
-def _resume_or_render(run_id: Optional[str]):
-    if run_id and _load_checkpoint(run_id):
+    st.markdown("---")
+    st.subheader("Összes letöltése (ZIP)")
+    start_run = st.button("Exportálás – Összes (ZIP)", type="primary", use_container_width=True)
+
+    def _resume_or_render(run_id: Optional[str]):
+        if run_id and _load_checkpoint(run_id):
+            export_engine(run_id, items)
+
+    _resume_or_render(st.session_state.get("current_run_id"))
+
+    if start_run:
+        run_id, cp = _resume_or_new_run(items)
+        st.info(f"Futás azonosító: `{run_id}`")
         export_engine(run_id, items)
 
-# Auto-resume render (progress megőrzése újratöltéskor)
-_resume_or_render(st.session_state.get("current_run_id"))
+with tab2:
+    st.write("Minden kurzus egyetlen táblában, Google Sheets-barát oszlopokkal.")
+    start_unified = st.button("Exportálás – Egy munkalap (minden kurzus együtt)", type="primary", use_container_width=True)
 
-if start_run:
-    run_id, cp = _resume_or_new_run(items)
-    st.info(f"Futás azonosító: `{run_id}`")
-    export_engine(run_id, items)
+    def _resume_or_render_unified(run_id: Optional[str]):
+        if run_id and _load_unified_cp(run_id):
+            unified_export_engine(run_id, items)
 
-# ÚJ: Összes – egy munkalap (CSV)
-st.markdown("---")
-st.subheader("Összes – egy munkalap (CSV)")
-if st.button("Exportálás – Egy munkalap (minden kurzus együtt)", use_container_width=True):
-    unified = export_unified_sheet(items)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        "Letöltés: Content_egylap_%s.csv" % ts,
-        data=unified,
-        file_name=f"Content_egylap_{ts}.csv",
-        mime="text/csv",
-    )
+    _resume_or_render_unified(st.session_state.get("unified_run_id"))
+
+    if start_unified:
+        urun_id, ucp = _resume_or_new_unified(items)
+        st.info(f"Futás azonosító: `{urun_id}`")
+        unified_export_engine(urun_id, items)
