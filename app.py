@@ -2,9 +2,6 @@ import os
 import io
 import re
 import csv
-import json
-import time
-import math
 import unicodedata
 import zipfile
 from datetime import datetime
@@ -12,7 +9,6 @@ from typing import List, Dict, Any, Tuple, Optional, Set
 
 import streamlit as st
 from notion_client import Client
-from notion_client.errors import APIResponseError
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Beállítások (ENV / secrets)
@@ -26,6 +22,10 @@ NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", st.secrets.get("NOTION_DATA
 APP_PASSWORD = os.getenv("APP_PASSWORD", st.secrets.get("APP_PASSWORD", ""))
 
 CSV_FIELDNAMES = ["kurzus", "sorszám", "név", "típus", "tartalom"]
+
+# Csak EZEKET a H2-ket figyeljük (fix, nem szerkeszthető):
+VIDEO_HEADING = "Videó szöveg"
+LESSON_HEADING = "Lecke szöveg"
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Unicode normalizálás & mojibake javítás
@@ -42,7 +42,6 @@ def _maybe_fix_mojibake(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
-    # Tipikus hibák (UTF-8 → Latin-1 félredekódolásból): Ã, Â, �
     if ("Ã" in s) or ("Â" in s) or ("�" in s):
         try:
             fixed = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
@@ -60,10 +59,7 @@ def _norm_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in row.items():
         kk = _maybe_fix_mojibake(k) if isinstance(k, str) else k
-        if isinstance(v, str):
-            out[kk] = _maybe_fix_mojibake(v)
-        else:
-            out[kk] = v
+        out[kk] = _maybe_fix_mojibake(v) if isinstance(v, str) else v
     return out
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -76,16 +72,13 @@ def _slug(s: str) -> str:
     s = re.sub(r"[\s-]+", "_", s)
     return s[:80] if len(s) > 80 else s
 
-def _zip_utf8(files: List[Tuple[str, bytes]], zip_name: Optional[str]=None) -> bytes:
-    """
-    files: list of (arcname, data) to write into a zip, enforcing UTF-8 filename flag.
-    """
+def _zip_utf8(files: List[Tuple[str, bytes]]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for arcname, data in files:
             arcname = _maybe_fix_mojibake(arcname).replace("\\", "/")
             zi = zipfile.ZipInfo(arcname)
-            zi.flag_bits |= 0x800  # UTF-8 név zászló
+            zi.flag_bits |= 0x800  # UTF-8 filename flag
             zf.writestr(zi, data, compress_type=zipfile.ZIP_DEFLATED)
     buf.seek(0)
     return buf.read()
@@ -112,14 +105,10 @@ def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
 
     out: Dict[str, str] = {}
     for i, p in enumerate(parts):
-        if i == 0:
-            out["tartalom"] = p
-        else:
-            out[f"tartalom_cont_{i}"] = p
+        out["tartalom" if i == 0 else f"tartalom_cont_{i}"] = p
     return out
 
 def _fix_numbered_lists(md: str) -> str:
-    # Egyszerűsített újraszámozás a "1. " kezdetű sorokra
     lines = md.splitlines()
     n = 1
     for i, line in enumerate(lines):
@@ -127,69 +116,54 @@ def _fix_numbered_lists(md: str) -> str:
             lines[i] = re.sub(r"^\s*\d+\.\s", f"{n}. ", line)
             n += 1
         elif line.strip() == "":
-            n = 1  # új lista szakasz
+            n = 1
     return "\n".join(lines)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Notion → Markdown
 # ────────────────────────────────────────────────────────────────────────────────
 def blocks_to_md(client: Client, block_id: str) -> str:
-    """Lekéri az oldal blokkjait és egyszerű Markdownná alakítja."""
     md_lines: List[str] = []
     cursor = None
     while True:
         resp = client.blocks.children.list(block_id=block_id, start_cursor=cursor) if cursor else client.blocks.children.list(block_id=block_id)
         for blk in resp.get("results", []):
             t = blk.get("type")
+            def rt(x): return "".join([r.get("plain_text","") for r in x.get("rich_text", [])])
             if t == "paragraph":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append(_maybe_fix_mojibake(txt))
+                md_lines.append(_maybe_fix_mojibake(rt(blk[t])))
             elif t == "heading_1":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append("# " + _maybe_fix_mojibake(txt))
+                md_lines.append("# " + _maybe_fix_mojibake(rt(blk[t])))
             elif t == "heading_2":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append("## " + _maybe_fix_mojibake(txt))
+                md_lines.append("## " + _maybe_fix_mojibake(rt(blk[t])))
             elif t == "heading_3":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append("### " + _maybe_fix_mojibake(txt))
+                md_lines.append("### " + _maybe_fix_mojibake(rt(blk[t])))
             elif t == "bulleted_list_item":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append(f"- {_maybe_fix_mojibake(txt)}")
+                md_lines.append(f"- {_maybe_fix_mojibake(rt(blk[t]))}")
             elif t == "numbered_list_item":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append(f"1. {_maybe_fix_mojibake(txt)}")
+                md_lines.append(f"1. {_maybe_fix_mojibake(rt(blk[t]))}")
             elif t == "to_do":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
                 checked = blk[t].get("checked", False)
-                md_lines.append(f"- [{'x' if checked else ' '}] {_maybe_fix_mojibake(txt)}")
+                md_lines.append(f"- [{'x' if checked else ' '}] {_maybe_fix_mojibake(rt(blk[t]))}")
             elif t == "quote":
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append("> " + _maybe_fix_mojibake(txt))
+                md_lines.append("> " + _maybe_fix_mojibake(rt(blk[t])))
             elif t == "code":
                 lang = blk[t].get("language", "")
-                txt = "".join([r.get("plain_text","") for r in blk[t].get("rich_text", [])])
-                md_lines.append(f"```{lang}\n{_maybe_fix_mojibake(txt)}\n```")
+                md_lines.append(f"```{lang}\n{_maybe_fix_mojibake(rt(blk[t]))}\n```")
             elif t == "divider":
                 md_lines.append("---")
-            # egyebek: toggle, callout stb. most kihagyva / egyszerűsíthető
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
         else:
             break
-
     md = "\n".join(md_lines).strip()
-    md = _fix_numbered_lists(md)
-    return md
+    return _fix_numbered_lists(md)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Notion DB lekérés & sor-építés
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_client() -> Client:
     return Client(auth=NOTION_API_KEY)
-
-def _get_database_schema(client: Client, db_id: str) -> Dict[str, Any]:
-    return client.databases.retrieve(db_id)
 
 def _get_all_pages(client: Client, db_id: str) -> List[Dict[str, Any]]:
     out = []
@@ -204,11 +178,9 @@ def _get_all_pages(client: Client, db_id: str) -> List[Dict[str, Any]]:
     return out
 
 def _get_prop(page: Dict[str, Any], name: str) -> Any:
-    props = page.get("properties", {})
-    return props.get(name)
+    return page.get("properties", {}).get(name)
 
 def _title_of(page: Dict[str, Any]) -> str:
-    # címtulajdonság autodetekció
     for key, prop in page.get("properties", {}).items():
         if prop.get("type") == "title":
             return _maybe_fix_mojibake("".join([t.get("plain_text","") for t in prop["title"]]))
@@ -228,28 +200,19 @@ def _select_value(prop: Dict[str, Any]) -> str:
     return ""
 
 def _extract_section(md: str, heading: str) -> str:
-    """
-    Visszaadja a megadott H2 címsor alatti szakasz tartalmát (a következő H2-ig), vágott- és tisztított formában.
-    Ha nincs ilyen címsor, vagy csak whitespace lenne, üres stringet ad vissza.
-    """
-    md = md or ""
-    # csak pontos megfelelés: "## Videó szöveg" vagy "## Lecke szöveg"
+    # PONTOS egyezés a két H2-re
     pat = re.compile(rf"^##\s*{re.escape(heading)}\s*$", flags=re.MULTILINE)
-    m = pat.search(md)
+    m = pat.search(md or "")
     if not m:
         return ""
     start = m.end()
-    m2 = re.search(r"^##\s+.+$", md[start:], flags=re.MULTILINE)
-    raw = md[start:start + (m2.start() if m2 else len(md))].strip()
+    m2 = re.search(r"^##\s+.+$", (md or "")[start:], flags=re.MULTILINE)
+    raw = (md or "")[start:start + (m2.start() if m2 else len(md or ""))].strip()
     return raw if raw.strip() else ""
 
 def _extract_video_or_lesson(md: str) -> str:
-    """
-    Prioritás: Videó szöveg > Lecke szöveg; egyik sincs → default üzenet.
-    Minden esetben kizárólag az egyik szakasz kerüljön a kimenetbe.
-    """
-    video = _extract_section(md, "Videó szöveg")
-    lesson = _extract_section(md, "Lecke szöveg")
+    video = _extract_section(md, VIDEO_HEADING)
+    lesson = _extract_section(md, LESSON_HEADING)
     if video:
         return video
     if lesson:
@@ -262,18 +225,9 @@ def _row_from_page(client: Client, page: Dict[str, Any]) -> Dict[str, str]:
     section = _select_value(_get_prop(page, "Szakasz"))
     group = _select_value(_get_prop(page, DEFAULT_GROUP_PROP))
     page_id = page["id"].replace("-", "")
-    content_full = blocks_to_md(client, page_id)
-
-    # → KIZÁRÓLAG Videó/Lecke szöveg szakaszok, a megadott prioritás szerint:
-    content = _extract_video_or_lesson(content_full)
-
-    row = {
-        "kurzus": group or "",
-        "sorszám": order or "",
-        "név": title or "",
-        "típus": section or "",
-        "tartalom": content or "",
-    }
+    md_full = blocks_to_md(client, page_id)
+    content = _extract_video_or_lesson(md_full)
+    row = {"kurzus": group or "", "sorszám": order or "", "név": title or "", "típus": section or "", "tartalom": content}
     return _norm_csv_row(row)
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -286,18 +240,13 @@ def export_group_csv_bytes(client: Client, pages: List[Dict[str, Any]]) -> bytes
     if not pages:
         return output.getvalue().encode("utf-8-sig")
 
-    rows_base: List[Dict[str, str]] = []
-    for pg in pages:
-        rows_base.append(_row_from_page(client, pg))
-
+    rows_base = [_row_from_page(client, pg) for pg in pages]
     split_rows: List[Dict[str, str]] = []
     max_extra = 0
     for r in rows_base:
         chunks = _split_content_for_csv(r.get("tartalom",""), MAX_CONTENT_CHARS)
         out = dict(r); out.pop("tartalom", None); out.update(chunks)
-        # keep track of max extra columns
-        extras = len(out) - len(CSV_FIELDNAMES)
-        max_extra = max(max_extra, extras)
+        max_extra = max(max_extra, len(out) - len(CSV_FIELDNAMES))
         split_rows.append(_norm_csv_row(out))
 
     fieldnames = CSV_FIELDNAMES + [f"tartalom_cont_{i}" for i in range(1, max_extra+1)]
@@ -312,18 +261,13 @@ def export_group_csv_bytes(client: Client, pages: List[Dict[str, Any]]) -> bytes
     return output.getvalue().encode("utf-8-sig")
 
 def export_unified_csv_bytes(client: Client, all_pages: List[Dict[str, Any]]) -> bytes:
-    rows: List[Dict[str, str]] = []
-    for pg in all_pages:
-        rows.append(_row_from_page(client, pg))
-
-    # most feldaraboljuk a tartalmat
+    rows = [_row_from_page(client, pg) for pg in all_pages]
     split_rows: List[Dict[str, str]] = []
     max_extra = 0
     for r in rows:
         chunks = _split_content_for_csv(r.get("tartalom",""), MAX_CONTENT_CHARS)
         out = dict(r); out.pop("tartalom", None); out.update(chunks)
-        extras = len(out) - len(CSV_FIELDNAMES)
-        max_extra = max(max_extra, extras)
+        max_extra = max(max_extra, len(out) - len(CSV_FIELDNAMES))
         split_rows.append(_norm_csv_row(out))
 
     fieldnames = CSV_FIELDNAMES + [f"tartalom_cont_{i}" for i in range(1, max_extra+1)]
@@ -353,7 +297,7 @@ def _auth():
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📤", layout="wide")
     st.title(APP_TITLE)
-    st.caption("Ékezetjavítás, UTF-8 (BOM) CSV, UTF-8 ZIP-fájlnevek és Videó/Lecke szöveg prioritás – **fixelve** ✅")
+    st.caption("Csak a **Videó szöveg** és **Lecke szöveg** H2-k figyelése • UTF-8 BOM CSV • UTF-8 ZIP-fájlnevek • ékezetjavítás ✅")
 
     if not NOTION_API_KEY or not NOTION_DATABASE_ID:
         st.error("Állítsd be a NOTION_API_KEY és NOTION_DATABASE_ID értékeket (ENV vagy st.secrets).")
@@ -361,11 +305,19 @@ def main():
 
     _auth()
 
+    with st.expander("Beállítások (információ)", expanded=True):
+        st.markdown(
+            "- **Figyelt szakaszok:**\n"
+            f"  - `## {VIDEO_HEADING}`\n"
+            f"  - `## {LESSON_HEADING}`\n\n"
+            "Más H2-ket a rendszer **nem** vesz figyelembe. Ha mindkettőben van tartalom, a **Videó szöveg** élvez elsőbbséget. "
+            "Ha egyik sincs, ezt írjuk ki: _Ehhez a leckéhez nem készült leírás._"
+        )
+
     client = _get_client()
     with st.spinner("Adatok lekérése a Notionból…"):
         pages = _get_all_pages(client, NOTION_DATABASE_ID)
 
-    # Csoportosítás
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for pg in pages:
         g = _select_value(_get_prop(pg, DEFAULT_GROUP_PROP)) or "(Ismeretlen)"
@@ -376,7 +328,6 @@ def main():
     st.write(f"Csoport tulajdonság: **{DEFAULT_GROUP_PROP}**")
     st.write(f"Csoportok száma: **{len(groups)}**")
 
-    # Tabok
     tab1, tab2 = st.tabs(["Kurzusonként külön CSV (ZIP)", "Minden egy CSV-ben"])
 
     with tab1:
