@@ -5,13 +5,13 @@ import csv
 import unicodedata
 import zipfile
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional
 
 import streamlit as st
 from notion_client import Client
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Beállítások (ENV / secrets)
+# Alapbeállítások
 # ────────────────────────────────────────────────────────────────────────────────
 APP_TITLE = "Notion → CSV Export – Kurzus"
 DEFAULT_GROUP_PROP = os.getenv("NOTION_PROPERTY_NAME", st.secrets.get("NOTION_PROPERTY_NAME", "Kurzus"))
@@ -23,12 +23,12 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", st.secrets.get("APP_PASSWORD", ""))
 
 CSV_FIELDNAMES = ["kurzus", "sorszám", "név", "típus", "tartalom"]
 
-# Csak EZEKET a H2-ket figyeljük (fix, nem szerkeszthető):
+# Csak EZEKET a H2-ket figyeljük (pontos egyezés, ékezetekkel!)
 VIDEO_HEADING = "Videó szöveg"
 LESSON_HEADING = "Lecke szöveg"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Unicode normalizálás & mojibake javítás
+# Unicode normalizálás / mojibake-javítás
 # ────────────────────────────────────────────────────────────────────────────────
 def _normalize_unicode(s: str) -> str:
     if s is None:
@@ -63,11 +63,10 @@ def _norm_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Segédek
+# Segédfüggvények
 # ────────────────────────────────────────────────────────────────────────────────
 def _slug(s: str) -> str:
-    s = _maybe_fix_mojibake(s)
-    s = s.strip().lower()
+    s = _maybe_fix_mojibake(s).strip().lower()
     s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
     s = re.sub(r"[\s-]+", "_", s)
     return s[:80] if len(s) > 80 else s
@@ -181,7 +180,7 @@ def _get_prop(page: Dict[str, Any], name: str) -> Any:
     return page.get("properties", {}).get(name)
 
 def _title_of(page: Dict[str, Any]) -> str:
-    for key, prop in page.get("properties", {}).items():
+    for _, prop in page.get("properties", {}).items():
         if prop.get("type") == "title":
             return _maybe_fix_mojibake("".join([t.get("plain_text","") for t in prop["title"]]))
     return ""
@@ -199,20 +198,27 @@ def _select_value(prop: Dict[str, Any]) -> str:
         return str(prop.get("number", "") or "")
     return ""
 
-def _extract_section(md: str, heading: str) -> str:
-    # PONTOS egyezés a két H2-re
+def _extract_section_exact(md: str, heading: str) -> str:
+    """
+    PONTOS egyezés a megadott H2 címsorra (## <heading>), csak ezt vágjuk ki,
+    a következő H2-ig. Ha nincs tartalom, üres stringet adunk vissza.
+    """
+    md = md or ""
     pat = re.compile(rf"^##\s*{re.escape(heading)}\s*$", flags=re.MULTILINE)
-    m = pat.search(md or "")
+    m = pat.search(md)
     if not m:
         return ""
     start = m.end()
-    m2 = re.search(r"^##\s+.+$", (md or "")[start:], flags=re.MULTILINE)
-    raw = (md or "")[start:start + (m2.start() if m2 else len(md or ""))].strip()
+    m2 = re.search(r"^##\s+.+$", md[start:], flags=re.MULTILINE)
+    raw = md[start:start + (m2.start() if m2 else len(md))].strip()
     return raw if raw.strip() else ""
 
 def _extract_video_or_lesson(md: str) -> str:
-    video = _extract_section(md, VIDEO_HEADING)
-    lesson = _extract_section(md, LESSON_HEADING)
+    """
+    Prioritás: Videó szöveg > Lecke szöveg. Egyik sincs → alapértelmezett üzenet.
+    """
+    video = _extract_section_exact(md, VIDEO_HEADING)
+    lesson = _extract_section_exact(md, LESSON_HEADING)
     if video:
         return video
     if lesson:
@@ -305,13 +311,13 @@ def main():
 
     _auth()
 
-    with st.expander("Beállítások (információ)", expanded=True):
+    with st.expander("Információ", expanded=True):
         st.markdown(
             "- **Figyelt szakaszok:**\n"
             f"  - `## {VIDEO_HEADING}`\n"
             f"  - `## {LESSON_HEADING}`\n\n"
-            "Más H2-ket a rendszer **nem** vesz figyelembe. Ha mindkettőben van tartalom, a **Videó szöveg** élvez elsőbbséget. "
-            "Ha egyik sincs, ezt írjuk ki: _Ehhez a leckéhez nem készült leírás._"
+            "Más H2-t **nem** figyelünk. Ha mindkettőben van tartalom, a **Videó szöveg** az elsődleges. "
+            "Ha egyik sem, a kimenet: _Ehhez a leckéhez nem készült leírás._"
         )
 
     client = _get_client()
@@ -339,22 +345,27 @@ def main():
                 data = export_group_csv_bytes(client, gpages)
                 arc = f"export_{_slug(gname)}.csv"
                 files.append((arc, data))
-                prog.progress((i+1)/max(1,len(groups)))
+                prog.progress((i+1)/max(1, len(groups)))
             zip_bytes = _zip_utf8(files)
             st.success("Export kész.")
-            st.download_button("ZIP letöltése", data=zip_bytes,
-                               file_name=f"notion_kurzus_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                               mime="application/zip")
+            st.download_button(
+                "ZIP letöltése",
+                data=zip_bytes,
+                file_name=f"notion_kurzus_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+            )
 
     with tab2:
         st.write("Összes oldal egyetlen CSV-ben (Excel-barát UTF-8 BOM-mal).")
         if st.button("Export indítása (1 CSV)", type="primary", use_container_width=True):
             data = export_unified_csv_bytes(client, pages)
             st.success("Export kész.")
-            st.download_button("CSV letöltése",
-                               data=data,
-                               file_name=f"Content_egylap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                               mime="text/csv")
+            st.download_button(
+                "CSV letöltése",
+                data=data,
+                file_name=f"Content_egylap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+            )
 
 if __name__ == "__main__":
     main()
