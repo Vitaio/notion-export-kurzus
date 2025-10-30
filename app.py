@@ -609,6 +609,7 @@ def main():
                             "kurzus": _get_select_or_text(pg, DEFAULT_GROUP_PROP) or "Ismeretlen",
                             "sorszám": _get_select_or_text(pg, "Sorszám"),
                             "szakasz": _get_select_or_text(pg, "Szakasz"),
+                            "tartalom": _get_select_or_text(pg, "Tartalom"),
                             "page_id": (pg.get("id","") or "")[:8] + "…"
                         })
                     if sample_rows:
