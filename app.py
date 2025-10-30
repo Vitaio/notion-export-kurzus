@@ -182,7 +182,6 @@ def _with_retry(call: Callable[[], Any], where: str, warn_placeholder=None):
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Notion → Markdown (rekurzív bejárás, kezeli toggle/column/callout)
-# (meghagyjuk – debughoz jól jöhet)
 # ────────────────────────────────────────────────────────────────────────────────
 def blocks_to_md(client: Client, block_id: str) -> str:
     def rt(payload: Dict[str, Any]) -> str:
@@ -587,7 +586,7 @@ def main():
     with st.expander("Csatlakozás ellenőrzése (opcionális)", expanded=False):
         st.write("**NOTION_API_KEY**:", _mask(api_key))
         st.write("**NOTION_DATABASE_ID (szabványosítva)**:", _mask(db_id))
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("🔍 Teszt kapcsolat", use_container_width=True):
                 info = st.empty()
@@ -609,16 +608,59 @@ def main():
                             "kurzus": _get_select_or_text(pg, DEFAULT_GROUP_PROP) or "Ismeretlen",
                             "sorszám": _get_select_or_text(pg, "Sorszám"),
                             "szakasz": _get_select_or_text(pg, "Szakasz"),
-                            "tartalom": _get_select_or_text(pg, "Tartalom"),
                             "page_id": (pg.get("id","") or "")[:8] + "…"
                         })
                     if sample_rows:
                         st.dataframe(sample_rows, use_container_width=True, hide_index=True)
-                        st.caption(f"Minta sorok: {len(sample_rows)}")
+                        st.caption(f"Minta sorok (meta): {len(sample_rows)}")
                     else:
                         st.warning("A lekérdezés nem adott vissza sort.")
                 except APIResponseError as e:
                     st.error(f"Hiba a minta-lekérdezésnél: {getattr(e,'code','ismeretlen')}")
+        with c3:
+            if st.button("📄 3 soros minta (tartalom)", use_container_width=True):
+                try:
+                    # Ha már van meta a state-ben, onnan veszünk 3-at, különben query
+                    pages_for_sample = []
+                    if st.session_state.get("pages_meta"):
+                        pages_for_sample = st.session_state["pages_meta"][:3]
+                    else:
+                        resp = _with_retry(lambda: client.databases.query(database_id=db_id, page_size=3),
+                                           "Databases.query (content sample)")
+                        pages_for_sample = resp.get("results", [])
+
+                    content_rows = []
+                    for pg in pages_for_sample:
+                        title = _get_title_from_page(pg)
+                        group = _get_select_or_text(pg, DEFAULT_GROUP_PROP) or "Ismeretlen"
+                        sorszam = _get_select_or_text(pg, "Sorszám")
+                        szakasz = _get_select_or_text(pg, "Szakasz")
+                        try:
+                            content = extract_section_content(client, pg["id"], VIDEO_HEADING)
+                            chosen = VIDEO_HEADING if content else ""
+                            if not content:
+                                content = extract_section_content(client, pg["id"], LESSON_HEADING)
+                                if content:
+                                    chosen = LESSON_HEADING
+                        except APIResponseError as e:
+                            content = ""
+                            chosen = ""
+                        preview = (content.replace("\n", " ")[:240] + "…") if len(content) > 240 else content.replace("\n", " ")
+                        content_rows.append({
+                            "név": title,
+                            "kurzus": group,
+                            "sorszám": sorszam,
+                            "szakasz": szakasz,
+                            "típus_detected": chosen or "—",
+                            "tartalom": preview
+                        })
+                    if content_rows:
+                        st.dataframe(content_rows, use_container_width=True, hide_index=True)
+                        st.caption(f"Tartalom minta sorok: {len(content_rows)} (max. 240 karakter előnézet)")
+                    else:
+                        st.warning("Nem találtam mintasorokat.")
+                except APIResponseError as e:
+                    st.error(f"Hiba a tartalom-mintánál: {getattr(e,'code','ismeretlen')}")
 
     # 1) Beolvasás – csak meta
     st.markdown("### 1) Kurzusok beolvasása")
