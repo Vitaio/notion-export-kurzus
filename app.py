@@ -2,10 +2,11 @@ import os
 import io
 import re
 import csv
+import time
 import unicodedata
 import zipfile
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Callable
 
 import streamlit as st
 from notion_client import Client
@@ -20,7 +21,15 @@ MAX_CONTENT_CHARS = int(os.getenv("MAX_CONTENT_CHARS", st.secrets.get("MAX_CONTE
 
 RAW_NOTION_API_KEY = os.getenv("NOTION_API_KEY", st.secrets.get("NOTION_API_KEY", ""))
 RAW_NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", st.secrets.get("NOTION_DATABASE_ID", ""))
+
 APP_PASSWORD = os.getenv("APP_PASSWORD", st.secrets.get("APP_PASSWORD", ""))
+
+# Rate limit beállítások (állíthatók ENV/secrets-ben)
+NOTION_PAGE_SIZE = int(os.getenv("NOTION_PAGE_SIZE", st.secrets.get("NOTION_PAGE_SIZE", 50)))  # 1..100
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", st.secrets.get("RETRY_MAX_ATTEMPTS", 6)))
+RETRY_BACKOFF_START = float(os.getenv("RETRY_BACKOFF_START", st.secrets.get("RETRY_BACKOFF_START", 1.0)))  # sec
+RETRY_BACKOFF_MAX = float(os.getenv("RETRY_BACKOFF_MAX", st.secrets.get("RETRY_BACKOFF_MAX", 30.0)))       # sec
+POLITE_DELAY_SEC = float(os.getenv("NOTION_POLITE_DELAY_SEC", st.secrets.get("NOTION_POLITE_DELAY_SEC", 0.35)))  # sec
 
 CSV_FIELDNAMES_BASE = ["kurzus", "sorszám", "név", "típus", "tartalom"]
 
@@ -67,25 +76,21 @@ def _norm_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
 # ────────────────────────────────────────────────────────────────────────────────
 def _mask(s: str, show: int = 6) -> str:
     s = s or ""
-    if len(s) <= show:
-        return s
-    return s[:show] + "…"
+    return s if len(s) <= show else s[:show] + "…"
 
 def _extract_uuid_like(s: str) -> str:
     """Teljes Notion URL-ből is kinyeri a DB azonosítót."""
     if not s:
         return ""
     s = s.strip()
-    # hyphenated
     m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", s)
     if m:
         return m.group(1)
-    # 32 hex
     m = re.search(r"([0-9a-fA-F]{32})", s)
     if m:
         u = m.group(1)
         return f"{u[0:8]}-{u[8:12]}-{u[12:16]}-{u[16:20]}-{u[20:32]}"
-    return s  # ha semmi nem illik, visszaadjuk az eredetit (lehet, hogy már jó)
+    return s
 
 def _sanitize_db_id(raw: str) -> str:
     return _extract_uuid_like(raw)
@@ -147,6 +152,38 @@ def _fix_numbered_lists(md: str) -> str:
     return "\n".join(lines)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Notion hívások – retry + backoff + Retry-After
+# ────────────────────────────────────────────────────────────────────────────────
+def _with_retry(call: Callable[[], Any], where: str, warn_placeholder=None):
+    delay = RETRY_BACKOFF_START
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return call()
+        except APIResponseError as e:
+            code = getattr(e, "code", "")
+            # mely kódokra próbálkozzunk újra
+            transient = code in ("rate_limited", "service_unavailable", "internal_server_error", "conflict_error")
+            if not transient or attempt == RETRY_MAX_ATTEMPTS:
+                if warn_placeholder:
+                    warn_placeholder.error(f"Notion API hiba ({where}): **{code or 'ismeretlen'}** – leállok.")
+                raise
+            # Retry-After tisztelete
+            retry_after = 0.0
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                if ra:
+                    try:
+                        retry_after = float(ra)
+                    except Exception:
+                        retry_after = 0.0
+            wait_for = max(retry_after, delay)
+            if warn_placeholder:
+                warn_placeholder.warning(f"{where}: **{code}** – újrapróbálkozás {attempt}/{RETRY_MAX_ATTEMPTS}, várakozás {wait_for:.1f}s")
+            time.sleep(wait_for)
+            delay = min(delay * 2.0, RETRY_BACKOFF_MAX)
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Notion → Markdown (rekurzív bejárás, kezeli toggle/column/callout)
 # ────────────────────────────────────────────────────────────────────────────────
 def blocks_to_md(client: Client, block_id: str) -> str:
@@ -156,12 +193,11 @@ def blocks_to_md(client: Client, block_id: str) -> str:
     def walk(bid: str, acc: List[str]):
         cursor = None
         while True:
-            try:
-                resp = client.blocks.children.list(block_id=bid, start_cursor=cursor) if cursor else client.blocks.children.list(block_id=bid)
-            except APIResponseError as e:
-                st.error(f"Notion blokkolvasás hiba: {e.code}. Ellenőrizd, hogy az integráció látja-e az oldalt.")
-                raise
-
+            resp = _with_retry(
+                lambda: client.blocks.children.list(block_id=bid, start_cursor=cursor) if cursor else
+                        client.blocks.children.list(block_id=bid),
+                where="Blocks.children.list"
+            )
             for blk in resp.get("results", []):
                 t = blk.get("type")
                 payload = blk.get(t, {}) if t else {}
@@ -209,6 +245,7 @@ def blocks_to_md(client: Client, block_id: str) -> str:
 
             if resp.get("has_more"):
                 cursor = resp.get("next_cursor")
+                time.sleep(POLITE_DELAY_SEC)
             else:
                 break
 
@@ -263,25 +300,30 @@ def _get_select_or_text(page: Dict[str, Any], prop_name: str) -> str:
 # I/O + CSV építés
 # ────────────────────────────────────────────────────────────────────────────────
 def _query_all_pages_with_status(client: Client, database_id: str) -> List[Dict[str, Any]]:
-    """Oldalak beolvasása státusz kijelzéssel + stabil hibaüzenetek."""
+    """Oldalak beolvasása státusz kijelzéssel + retry/backoff."""
     status = st.empty()
+    warn = st.empty()
     pages: List[Dict[str, Any]] = []
     cursor = None
     batch = 0
     while True:
         batch += 1
         status.info(f"Notion lekérdezés… (batch {batch}, eddig {len(pages)} oldal)")
-        try:
-            resp = client.databases.query(database_id=database_id, start_cursor=cursor) if cursor else client.databases.query(database_id=database_id)
-        except APIResponseError as e:
-            _render_api_error_hint(e, where="Databases.query")
-            st.stop()
+        resp = _with_retry(
+            lambda: client.databases.query(database_id=database_id, start_cursor=cursor, page_size=NOTION_PAGE_SIZE)
+                    if cursor else
+                    client.databases.query(database_id=database_id, page_size=NOTION_PAGE_SIZE),
+            where="Databases.query",
+            warn_placeholder=warn
+        )
         pages.extend(resp.get("results", []))
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
+            time.sleep(POLITE_DELAY_SEC)
         else:
             break
     status.success(f"Kész: {len(pages)} oldal beolvasva.")
+    warn.empty()
     return pages
 
 def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -290,16 +332,18 @@ def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) 
     n = len(pages)
     prog = st.progress(0.0)
     note = st.empty()
+    warn = st.empty()
     for i, page in enumerate(pages):
         title = _get_title_from_page(page)
         group = _get_select_or_text(page, DEFAULT_GROUP_PROP) or "Ismeretlen"
         sorszam = _get_select_or_text(page, "Sorszám")
         szakasz = _get_select_or_text(page, "Szakasz")
 
+        # blokkok lekérdezése retry-jal
         try:
             md = blocks_to_md(client, page["id"])
         except APIResponseError as e:
-            st.warning(f"Blokkolvasás kihagyva ennél az oldalon: '{title}' (hiba: {e.code})")
+            warn.warning(f"Blokkolvasás kihagyva: '{title}' (hiba: {getattr(e, 'code', 'ismeretlen')})")
             md = ""
 
         chosen_type = None
@@ -322,7 +366,10 @@ def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) 
         if n:
             prog.progress((i + 1) / n)
             note.text(f"Feldolgozás: {i+1}/{n} oldal")
+        time.sleep(POLITE_DELAY_SEC * 0.5)  # finomabb terhelés
+
     note.text(f"Kész: {len(rows)} sor")
+    warn.empty()
     return rows
 
 def _group_by(rows: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -356,24 +403,24 @@ def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> byte
     return _zip_utf8(files)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Hibákhoz magyarázat
+# Hibákhoz rövid magyarázat
 # ────────────────────────────────────────────────────────────────────────────────
 def _render_api_error_hint(e: APIResponseError, where: str):
-    st.error(f"Notion API hiba ({where}): **{e.code}**")
+    st.error(f"Notion API hiba ({where}): **{getattr(e,'code','ismeretlen')}**")
     hints = {
-        "unauthorized": "Érvénytelen vagy hiányzó NOTION_API_KEY. Ellenőrizd a token értékét.",
-        "restricted_resource": "Az integráció nincs megosztva ezzel az erőforrással. A Notionban: Share → **Add connections** → válaszd ki az integrációdat.",
-        "object_not_found": "A megadott Database ID nem található vagy nincs jogosultságod. Ellenőrizd az azonosítót (URL-ből kivágott UUID is jó).",
-        "validation_error": "Érvénytelen paraméter (pl. hibás ID formátum). Ellenőrizd, hogy a Database ID UUID formátumú.",
-        "rate_limited": "Rate limit. Próbáld meg később vagy csökkentsd a kérések számát.",
-        "conflict_error": "Konfliktusos kérés. Próbáld meg újra.",
-        "internal_server_error": "Notion szerverhiba. Próbáld meg újra.",
+        "unauthorized": "Érvénytelen vagy hiányzó NOTION_API_KEY.",
+        "restricted_resource": "Az integráció nincs megosztva ezzel a DB-vel (Share → Add connections).",
+        "object_not_found": "A Database ID hibás, vagy nincs jogosultság.",
+        "validation_error": "Hibás paraméter (pl. azonosító formátum).",
+        "rate_limited": "Rate limit – újrapróbálkozás automatikusan, vagy csökkentsd a kérések számát.",
+        "internal_server_error": "Notion szerverhiba.",
+        "service_unavailable": "Notion átmenetileg nem elérhető.",
+        "conflict_error": "Ütközés a kérésben.",
     }
-    msg = hints.get(getattr(e, "code", ""), "Ismeretlen hiba. Ellenőrizd: token, DB ID, megosztás az integrációnak.")
-    st.info(msg)
+    st.info(hints.get(getattr(e, "code", ""), "Ismeretlen hiba."))
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streamlit UI
+# Streamlit UI (gombnyomásra indul, progress, fő gomb kiemelve)
 # ────────────────────────────────────────────────────────────────────────────────
 def _check_secrets():
     missing = []
@@ -392,7 +439,6 @@ def _password_gate():
     st.session_state.setdefault("_auth_ok", False)
     if st.session_state["_auth_ok"]:
         return True
-
     with st.form("auth_form", clear_on_submit=True):
         st.markdown("### Belépés")
         pw = st.text_input("Jelszó", type="password")
@@ -411,7 +457,7 @@ def main():
     st.title(APP_TITLE)
     st.caption("Notion adatbázis → CSV export. A 'Videó szöveg' / 'Lecke szöveg' szakaszok kinyerése, toggle/oszlop alatt is.")
 
-    # UI finomhangolás: fő gomb hangsúly
+    # Fő gomb hangsúly + finom UI
     st.markdown("""
     <style>
     .primary-big button {font-size:1.08rem; padding:0.9rem 1rem; font-weight:700;}
@@ -424,20 +470,18 @@ def main():
 
     api_key = RAW_NOTION_API_KEY.strip()
     db_id = _sanitize_db_id(RAW_NOTION_DATABASE_ID)
+    client = Client(auth=api_key)
 
-    st.markdown("### Diagnosztika")
-    with st.expander("Csatlakozás ellenőrzése", expanded=True):
+    # Diagnosztika (opcionális)
+    with st.expander("Csatlakozás ellenőrzése (opcionális)", expanded=False):
         st.write("**NOTION_API_KEY**:", _mask(api_key))
         st.write("**NOTION_DATABASE_ID (szabványosítva)**:", _mask(db_id))
-        client = Client(auth=api_key)
-        if st.button("🔍 Teszt kapcsolat (adatbázis meta lekérése)", use_container_width=True):
+        if st.button("🔍 Teszt kapcsolat", use_container_width=True):
+            info = st.empty()
             try:
-                meta = client.databases.retrieve(database_id=db_id)
-                title = ""
-                props = meta.get("title", [])
-                if props:
-                    title = "".join([t.get("plain_text", "") for t in props])
-                st.success(f"Siker! Adatbázis neve: **{title or '(nincs cím)'}**")
+                meta = _with_retry(lambda: client.databases.retrieve(database_id=db_id), "Databases.retrieve", info)
+                title = "".join([t.get("plain_text", "") for t in meta.get("title", [])]) if meta.get("title") else ""
+                info.success(f"Siker! Adatbázis neve: **{title or '(nincs cím)'}**")
             except APIResponseError as e:
                 _render_api_error_hint(e, where="Databases.retrieve")
                 st.stop()
@@ -451,11 +495,13 @@ def main():
         st.info("Válassz export módot fent. A feldolgozás csak gombnyomásra indul.")
         return
 
-    client = Client(auth=api_key)
-
     # 1) Beolvasás
     st.markdown("#### 1) Oldalak beolvasása")
-    pages = _query_all_pages_with_status(client, db_id)
+    try:
+        pages = _query_all_pages_with_status(client, db_id)
+    except APIResponseError as e:
+        _render_api_error_hint(e, where="Databases.query")
+        return
     if not pages:
         st.warning("Nem érkezett oldal a Notionből.")
         return
