@@ -79,7 +79,6 @@ def _mask(s: str, show: int = 6) -> str:
     return s if len(s) <= show else s[:show] + "…"
 
 def _extract_uuid_like(s: str) -> str:
-    """Teljes Notion URL-ből is kinyeri a DB azonosítót."""
     if not s:
         return ""
     s = s.strip()
@@ -138,6 +137,7 @@ def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for i, p in enumerate(parts):
         out["tartalom" if i == 0 else f"tartalom_cont_{i}"] = p
+        # üres cont oszlopokat nem hozunk létre itt – a writer kezeli
     return out
 
 def _fix_numbered_lists(md: str) -> str:
@@ -253,7 +253,6 @@ def blocks_to_md(client: Client, block_id: str) -> str:
     return _fix_numbered_lists(md)
 
 def _extract_section_exact(md: str, heading: str) -> str:
-    """H2/H3 címsor: kis/nagybetű független, opcionális ':'."""
     md = (_normalize_unicode(md) or "").replace("\u00A0", " ")
     pat = re.compile(rf"^#{2,3}\s*{re.escape(heading)}\s*:?\s*$", flags=re.MULTILINE | re.IGNORECASE)
     m = pat.search(md)
@@ -295,10 +294,9 @@ def _get_select_or_text(page: Dict[str, Any], prop_name: str) -> str:
     return ""
 
 # ────────────────────────────────────────────────────────────────────────────────
-# I/O + CSV építés
+# Beolvasás (csak meta), majd később feldolgozás a választás szerint
 # ────────────────────────────────────────────────────────────────────────────────
-def _query_all_pages_with_status(client: Client, database_id: str) -> List[Dict[str, Any]]:
-    """Oldalak beolvasása státusz kijelzéssel + retry/backoff."""
+def _query_all_pages_meta(client: Client, database_id: str) -> List[Dict[str, Any]]:
     status = st.empty()
     warn = st.empty()
     pages: List[Dict[str, Any]] = []
@@ -320,12 +318,11 @@ def _query_all_pages_with_status(client: Client, database_id: str) -> List[Dict[
             time.sleep(POLITE_DELAY_SEC)
         else:
             break
-    status.success(f"Kész: {len(pages)} oldal beolvasva.")
+    status.success(f"Kész: {len(pages)} oldal meta beolvasva.")
     warn.empty()
     return pages
 
 def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sorok építése előrehaladás jelzéssel + hibatűrés blokkolvasáskor."""
     rows: List[Dict[str, Any]] = []
     n = len(pages)
     prog = st.progress(0.0)
@@ -364,7 +361,6 @@ def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) 
             prog.progress((i + 1) / n)
             note.text(f"Feldolgozás: {i+1}/{n} oldal")
         time.sleep(POLITE_DELAY_SEC * 0.5)
-
     note.text(f"Kész: {len(rows)} sor")
     warn.empty()
     return rows
@@ -388,7 +384,7 @@ def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
-    return buf.getvalue().encode("utf-8-sig")  # BOM
+    return buf.getvalue().encode("utf-8-sig")
 
 def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> bytes:
     groups = _group_by(rows, group_key)
@@ -399,19 +395,19 @@ def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> byte
         files.append((fname, csv_bytes))
     return _zip_utf8(files)
 
-def _filter_rows_by_courses(rows: List[Dict[str, Any]], selected_courses: List[str]) -> List[Dict[str, Any]]:
+def _filter_pages_by_courses(pages: List[Dict[str, Any]], selected_courses: List[str]) -> List[Dict[str, Any]]:
     if not selected_courses:
         return []
     sel = set(selected_courses)
     out = []
-    for r in rows:
-        g = r.get("kurzus") or "Ismeretlen"
+    for pg in pages:
+        g = _get_select_or_text(pg, DEFAULT_GROUP_PROP) or "Ismeretlen"
         if g in sel:
-            out.append(r)
+            out.append(pg)
     return out
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streamlit UI (gombnyomásra indul, progress, kurzus-választó multiselect)
+# Streamlit UI – 2 lépcső: 1) Beolvasás, 2) Választás → Feldolgozás → Export
 # ────────────────────────────────────────────────────────────────────────────────
 def _check_secrets():
     missing = []
@@ -446,21 +442,28 @@ def _password_gate():
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
     st.title(APP_TITLE)
-    st.caption("Notion adatbázis → CSV export. A 'Videó szöveg' / 'Lecke szöveg' szakaszok kinyerése, toggle/oszlop alatt is.")
-
-    # UI finomhangolás: primary gomb erősebb
-    st.markdown("""
-    <style>
-    .secondary button {opacity:0.95;}
-    </style>
-    """, unsafe_allow_html=True)
+    st.caption("Beolvasás után választhatsz: minden egyben, kurzusonként ZIP, vagy kiválasztott kurzus(ok) → CSV. A feldolgozás csak exportkor indul.")
 
     _check_secrets()
     _password_gate()
 
+    # kis UI finomhangolás
+    st.markdown("""
+    <style>
+    .secondary button {opacity:0.95;}
+    .pill {border:1px solid rgba(0,0,0,.08); padding:.6rem .8rem; border-radius:.75rem; background:rgba(0,0,0,.03);}
+    </style>
+    """, unsafe_allow_html=True)
+
     api_key = RAW_NOTION_API_KEY.strip()
     db_id = _sanitize_db_id(RAW_NOTION_DATABASE_ID)
     client = Client(auth=api_key)
+
+    # Session state
+    st.session_state.setdefault("pages_meta", None)
+    st.session_state.setdefault("courses", [])
+    st.session_state.setdefault("export_choice", "Minden egy CSV-ben")
+    st.session_state.setdefault("selected_courses", [])
 
     with st.expander("Csatlakozás ellenőrzése (opcionális)", expanded=False):
         st.write("**NOTION_API_KEY**:", _mask(api_key))
@@ -472,69 +475,130 @@ def main():
                 title = "".join([t.get("plain_text", "") for t in meta.get("title", [])]) if meta.get("title") else ""
                 info.success(f"Siker! Adatbázis neve: **{title or '(nincs cím)'}**")
             except APIResponseError as e:
-                st.error(f"Hiba: {getattr(e,'code','ismeretlen')}")
-                return
+                info.error(f"Hiba: {getattr(e,'code','ismeretlen')}")
 
-    # Indító gomb a feldolgozáshoz
-    st.markdown("### Indítás")
-    start = st.button("🔄 Kurzusok beolvasása és feldolgozása", type="primary", use_container_width=True)
-    if not start:
-        st.info("Kattints a fenti gombra a feldolgozás indításához, majd válaszd ki a kurzusokat az exporthoz.")
+    # 1) Beolvasás – csak meta
+    st.markdown("### 1) Kurzusok beolvasása")
+    cols = st.columns([1, 1, 2])
+    with cols[0]:
+        start = st.button("📥 Oldalak beolvasása (Notion)", type="primary", use_container_width=True)
+    with cols[1]:
+        reset = st.button("♻️ Újra beolvasás", use_container_width=True)
+
+    if start or reset or (st.session_state["pages_meta"] is None):
+        # ha még nincs meta a state-ben, vagy újraolvasást kértél
+        try:
+            pages = _query_all_pages_meta(client, db_id)
+        except APIResponseError as e:
+            st.error(f"Notion API hiba (Databases.query): {getattr(e,'code','ismeretlen')}")
+            return
+        st.session_state["pages_meta"] = pages
+        # kurzuslista
+        groups = sorted({(_get_select_or_text(pg, DEFAULT_GROUP_PROP) or "Ismeretlen") for pg in pages}, key=lambda s: s.lower())
+        st.session_state["courses"] = groups
+        st.session_state["selected_courses"] = groups[:]  # default: mind
+        st.success(f"{len(pages)} oldal meta beolvasva. Kurzusok: {len(groups)}")
+
+    if not st.session_state["pages_meta"]:
+        st.info("Kattints a „Oldalak beolvasása” gombra a folytatáshoz.")
         return
 
-    # 1) Beolvasás
-    st.markdown("#### 1) Oldalak beolvasása")
-    try:
-        pages = _query_all_pages_with_status(client, db_id)
-    except APIResponseError as e:
-        st.error(f"Notion API hiba (Databases.query): {getattr(e,'code','ismeretlen')}")
+    # 2) Választás – export mód és (opcionális) kurzusok
+    st.markdown("### 2) Export beállítása")
+    choice = st.radio(
+        "Export mód",
+        options=["Minden egy CSV-ben", "ZIP – kurzusonként", "Kiválasztott kurzusok → CSV"],
+        horizontal=True,
+        index=["Minden egy CSV-ben", "ZIP – kurzusonként", "Kiválasztott kurzusok → CSV"].index(st.session_state["export_choice"])
+    )
+    st.session_state["export_choice"] = choice
+
+    if choice == "Kiválasztott kurzusok → CSV":
+        with st.container(border=True):
+            left, right = st.columns([3, 1])
+            with left:
+                selected = st.multiselect(
+                    "Válaszd ki a kurzusokat",
+                    options=st.session_state["courses"],
+                    default=st.session_state["selected_courses"],
+                    help="Csak a kijelölt kurzusok kerülnek a CSV-be."
+                )
+            with right:
+                st.write("")  # spacing
+                colA, colB = st.columns(2)
+                if colA.button("Összes", use_container_width=True):
+                    selected = st.session_state["courses"][:]
+                if colB.button("Törlés", use_container_width=True):
+                    selected = []
+            st.session_state["selected_courses"] = selected
+            st.caption(f"Kijelölt kurzusok: **{len(selected)}** / {len(st.session_state['courses'])}")
+
+    # 3) Feldolgozás → Export (csak most indul a lassabb lépés!)
+    st.markdown("### 3) Feldolgozás és export")
+    export_label = {
+        "Minden egy CSV-ben": "▶️ Feldolgozás és export – MINDEN egy CSV-be",
+        "ZIP – kurzusonként": "▶️ Feldolgozás és export – kurzusonként ZIP",
+        "Kiválasztott kurzusok → CSV": "▶️ Feldolgozás és export – KIVÁLASZTOTT kurzusok"
+    }[choice]
+    export_type = "primary" if choice == "Minden egy CSV-ben" else "secondary"
+    go = st.button(export_label, type=export_type, use_container_width=True)
+
+    if not go:
+        st.info("Állítsd be az export módot, majd indítsd a feldolgozást a fenti gombbal.")
         return
-    if not pages:
-        st.warning("Nem érkezett oldal a Notionből.")
-        return
 
-    # 2) Feldolgozás
-    st.markdown("#### 2) Tartalom feldolgozása")
-    rows = _rows_from_pages_with_progress(client, pages)
+    # oldalak szűrése a választás szerint (a lassú blokk-feldolgozás előtt!)
+    pages_meta = st.session_state["pages_meta"]
+    if choice == "Kiválasztott kurzusok → CSV":
+        pages_to_process = _filter_pages_by_courses(pages_meta, st.session_state["selected_courses"])
+        if not pages_to_process:
+            st.warning("Nincs kiválasztott kurzus.")
+            return
+    else:
+        pages_to_process = pages_meta
 
-    # 3) Kurzusválasztás és export
-    st.markdown("#### 3) Kurzusválasztás és export")
-    # opcionlista felépítése
-    groups = sorted({(r.get("kurzus") or "Ismeretlen") for r in rows}, key=lambda s: s.lower())
-    default_sel = groups  # alapértelmezés: mind
-    selected = st.multiselect("Válaszd ki a kurzusokat", options=groups, default=default_sel, help="A kiválasztott kurzusok kerülnek a letöltésbe.")
+    # 3/a) Lassú feldolgozás csak a kiválasztott subsetre
+    rows = _rows_from_pages_with_progress(client, pages_to_process)
 
-    sel_rows = _filter_rows_by_courses(rows, selected)
-    st.caption(f"Kiválasztott kurzusok: **{len(selected)}** • sorok: **{len(sel_rows)}** / összes: {len(rows)}")
-
-    colA, colB = st.columns([1.6, 1])
-    with colA:
-        csv_bytes = _csv_bytes(sel_rows)
+    # 3/b) Export
+    if choice == "Minden egy CSV-ben":
+        csv_bytes = _csv_bytes(rows)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.success(f"Kész: {len(rows)} sor egy CSV-ben.")
         st.download_button(
-            label="⬇️ CSV – csak a kiválasztott kurzusok",
+            label="CSV letöltése",
             data=csv_bytes,
-            file_name=f"export_kiválasztott_{ts}.csv",
+            file_name=f"export_minden_{ts}.csv",
             mime="text/csv",
             type="primary",
             use_container_width=True,
-            key="dl_selected_csv",
-            disabled=not sel_rows,
-            help="Az összes kijelölt kurzus egyetlen CSV fájlban (UTF-8 BOM).",
+            key="dl_all",
         )
-    with colB:
-        zip_bytes = _zip_by_group(sel_rows, group_key="kurzus")
+    elif choice == "ZIP – kurzusonként":
+        zip_bytes = _zip_by_group(rows, group_key="kurzus")
         ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.success(f"Kész: {len(rows)} sor, kurzusonként csoportosítva (ZIP).")
         st.download_button(
-            label="ZIP – kurzusonként (kiválasztottak)",
+            label="ZIP letöltése",
             data=zip_bytes,
-            file_name=f"export_kiválasztott_kurzusonként_{ts2}.zip",
+            file_name=f"export_kurzusonként_{ts2}.zip",
             mime="application/zip",
             type="secondary",
             use_container_width=True,
-            key="dl_selected_zip",
-            disabled=not sel_rows,
-            help="A kijelölt kurzusok külön CSV-ként, ZIP-be csomagolva.",
+            key="dl_zip",
+        )
+    else:  # Kiválasztott kurzusok → CSV
+        csv_bytes = _csv_bytes(rows)
+        ts3 = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.success(f"Kész: {len(rows)} sor a kijelölt kurzus(ok)ból.")
+        st.download_button(
+            label="CSV letöltése (kiválasztott kurzusok)",
+            data=csv_bytes,
+            file_name=f"export_kiválasztott_{ts3}.csv",
+            mime="text/csv",
+            type="primary",
+            use_container_width=True,
+            key="dl_selected",
         )
 
 if __name__ == "__main__":
