@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -24,6 +23,7 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", st.secrets.get("APP_PASSWORD", ""))
 
 CSV_FIELDNAMES_BASE = ["kurzus", "sorszám", "név", "típus", "tartalom"]
 
+# Keresett címsorok (H2/H3-on): rugalmas egyezés, opcionális ':'
 VIDEO_HEADING = "Videó szöveg"
 LESSON_HEADING = "Lecke szöveg"
 
@@ -94,7 +94,7 @@ def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
     while start < len(text):
         end = min(len(text), start + max_len)
         window = text[start:end]
-        cut = window.rfind("\\n\\n")
+        cut = window.rfind("\n\n")
         if cut >= int(max_len * 0.6):
             end = start + cut
         part = text[start:end].rstrip()
@@ -111,15 +111,15 @@ def _fix_numbered_lists(md: str) -> str:
     lines = md.splitlines()
     n = 1
     for i, line in enumerate(lines):
-        if re.match(r"^\\s*\\d+\\.\\s", line):
-            lines[i] = re.sub(r"^\\s*\\d+\\.\\s", f"{n}. ", line)
+        if re.match(r"^\s*\d+\.\s", line):
+            lines[i] = re.sub(r"^\s*\d+\.\s", f"{n}. ", line)
             n += 1
         elif line.strip() == "":
             n = 1
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Notion → Markdown (rekurzív, kezeli a toggle/column/callout-ot)
+# Notion → Markdown (rekurzív bejárás, kezeli toggle/column/callout)
 # ────────────────────────────────────────────────────────────────────────────────
 def blocks_to_md(client: Client, block_id: str) -> str:
     def rt(payload: Dict[str, Any]) -> str:
@@ -159,7 +159,7 @@ def blocks_to_md(client: Client, block_id: str) -> str:
                 elif t == "code":
                     code_text = "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
                     lang = payload.get("language", "")
-                    line = f"```{lang}\\n{_maybe_fix_mojibake(code_text)}\\n```"
+                    line = f"```{lang}\n{_maybe_fix_mojibake(code_text)}\n```"
                 elif t == "divider":
                     line = "---"
                 elif t in ("callout", "toggle"):
@@ -181,7 +181,7 @@ def blocks_to_md(client: Client, block_id: str) -> str:
 
     out_lines: List[str] = []
     walk(block_id, out_lines)
-    md = "\\n".join(out_lines).strip()
+    md = "\n".join(out_lines).strip()
     return _fix_numbered_lists(md)
 
 def _extract_section_exact(md: str, heading: str) -> str:
@@ -192,13 +192,14 @@ def _extract_section_exact(md: str, heading: str) -> str:
     - opcionális kettőspont a végén
     A kijelölt H2/H3-tól a KÖVETKEZŐ H2/H3-ig vágunk.
     """
-    md = (unicodedata.normalize("NFC", md or "")).replace("\\u00A0", " ")
-    pat = re.compile(rf"^##{{1,2}}\\s*{re.escape(heading)}\\s*:?\\s*$", flags=re.MULTILINE | re.IGNORECASE)
+    md = (_normalize_unicode(md) or "").replace("\u00A0", " ")
+    # Egyszerűbb: #{2,3} → '##' vagy '###'
+    pat = re.compile(rf"^#{2,3}\s*{re.escape(heading)}\s*:?\s*$", flags=re.MULTILINE | re.IGNORECASE)
     m = pat.search(md)
     if not m:
         return ""
     start = m.end()
-    m2 = re.search(r"^##{1,2}\\s+.+$", md[start:], flags=re.MULTILINE)
+    m2 = re.search(r"^#{2,3}\s+.+$", md[start:], flags=re.MULTILINE)
     raw = md[start:start + (m2.start() if m2 else len(md))].strip()
     return raw if raw.strip() else ""
 
@@ -310,7 +311,7 @@ def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> byte
     return _zip_utf8(files)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streamlit UI (preview nélkül, jelszópanel eltűnik belépés után; fő gomb kiemelve)
+# Streamlit UI (preview nélkül, belépés után a jelszópanel eltűnik; fő gomb kiemelve)
 # ────────────────────────────────────────────────────────────────────────────────
 def _check_secrets():
     missing = []
@@ -338,7 +339,7 @@ def _password_gate():
             if pw == APP_PASSWORD:
                 st.session_state["_auth_ok"] = True
                 st.success("Sikeres belépés.")
-                st.experimental_rerun()
+                st.rerun()  # FIX: experimental_rerun → rerun
             else:
                 st.error("Hibás jelszó.")
     st.stop()
@@ -353,6 +354,7 @@ def main():
     st.title(APP_TITLE)
     st.caption("Notion adatbázis → CSV export. A 'Videó szöveg' / 'Lecke szöveg' szakaszok kinyerése, toggle/oszlop alatt is.")
 
+    # Minimál stílus: emelt súly a fő gombon
     st.markdown("""
     <style>
     .big-primary button {font-size:1.08rem; padding:0.9rem 1rem; font-weight:700;}
