@@ -37,7 +37,7 @@ VIDEO_HEADING = "Videó szöveg"
 LESSON_HEADING = "Lecke szöveg"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Unicode / normalizálás
+# Unicode normalizálás / mojibake-javítás
 # ────────────────────────────────────────────────────────────────────────────────
 def _normalize_unicode(s: str) -> str:
     if s is None:
@@ -71,13 +71,13 @@ def _norm_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
         out[kk] = _maybe_fix_mojibake(v) if isinstance(v, str) else v
     return out
 
+# ────────────────────────────────────────────────────────────────────────────────
+# ID / beállítás segédek
+# ────────────────────────────────────────────────────────────────────────────────
 def _mask(s: str, show: int = 6) -> str:
     s = s or ""
     return s if len(s) <= show else s[:show] + "…"
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Azonosítók / URL → UUID
-# ────────────────────────────────────────────────────────────────────────────────
 def _extract_uuid_like(s: str) -> str:
     if not s:
         return ""
@@ -95,7 +95,7 @@ def _sanitize_db_id(raw: str) -> str:
     return _extract_uuid_like(raw)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Közös segédek
+# Segédfüggvények
 # ────────────────────────────────────────────────────────────────────────────────
 def _slug(s: str) -> str:
     s = _maybe_fix_mojibake(s).strip().lower()
@@ -181,7 +181,90 @@ def _with_retry(call: Callable[[], Any], where: str, warn_placeholder=None):
             delay = min(delay * 2.0, RETRY_BACKOFF_MAX)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Notion – blokkszintű bejárás + szekció kinyerés
+# Notion → Markdown (rekurzív bejárás, kezeli toggle/column/callout)
+# (meghagyjuk – debughoz jól jöhet)
+# ────────────────────────────────────────────────────────────────────────────────
+def blocks_to_md(client: Client, block_id: str) -> str:
+    def rt(payload: Dict[str, Any]) -> str:
+        return "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
+
+    def walk(bid: str, acc: List[str]):
+        cursor = None
+        while True:
+            resp = _with_retry(
+                lambda: client.blocks.children.list(block_id=bid, start_cursor=cursor) if cursor else
+                        client.blocks.children.list(block_id=bid),
+                where="Blocks.children.list"
+            )
+            for blk in resp.get("results", []):
+                t = blk.get("type")
+                payload = blk.get(t, {}) if t else {}
+                has_children = blk.get("has_children", False)
+
+                line = None
+                text = ""
+                if isinstance(payload, dict) and "rich_text" in payload:
+                    text = _maybe_fix_mojibake(rt(payload))
+
+                if t == "paragraph":
+                    line = text
+                elif t == "heading_1":
+                    line = "# " + text
+                elif t == "heading_2":
+                    line = "## " + text
+                elif t == "heading_3":
+                    line = "### " + text
+                elif t == "bulleted_list_item":
+                    line = "- " + text
+                elif t == "numbered_list_item":
+                    line = "1. " + text
+                elif t == "quote":
+                    line = "> " + text
+                elif t == "to_do":
+                    checked = payload.get("checked", False)
+                    line = f"- [{'x' if checked else ' '}] " + text
+                elif t == "code":
+                    code_text = "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
+                    lang = payload.get("language", "")
+                    line = f"```{lang}\n{_maybe_fix_mojibake(code_text)}\n```"
+                elif t == "divider":
+                    line = "---"
+                elif t in ("callout", "toggle"):
+                    if text:
+                        line = "> " + text
+                elif t in ("column_list", "column", "synced_block", "synced_block_reference", "table", "table_row"):
+                    line = None
+
+                if line is not None and str(line).strip() != "":
+                    acc.append(line)
+
+                if has_children:
+                    walk(blk["id"], acc)
+
+            if resp.get("has_more"):
+                cursor = resp.get("next_cursor")
+                time.sleep(POLITE_DELAY_SEC)
+            else:
+                break
+
+    out_lines: List[str] = []
+    walk(block_id, out_lines)
+    md = "\n".join(out_lines).strip()
+    return _fix_numbered_lists(md)
+
+def _extract_section_exact(md: str, heading: str) -> str:
+    md = (_normalize_unicode(md) or "").replace("\u00A0", " ")
+    pat = re.compile(rf"^#{2,3}\s*{re.escape(heading)}\s*:?\s*$", flags=re.MULTILINE | re.IGNORECASE)
+    m = pat.search(md)
+    if not m:
+        return ""
+    start = m.end()
+    m2 = re.search(r"^#{2,3}\s+.+$", md[start:], flags=re.MULTILINE)
+    raw = md[start:start + (m2.start() if m2 else len(md))].strip()
+    return raw if raw.strip() else ""
+
+# ────────────────────────────────────────────────────────────────────────────────
+# BLOKK-SZINTŰ KINYERÉS toggle/H2/H3 esetekre (stabil szekciókeresés)
 # ────────────────────────────────────────────────────────────────────────────────
 def _rt(payload: Dict[str, Any]) -> str:
     return "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
@@ -207,7 +290,6 @@ def _list_children(client: Client, block_id: str) -> List[Dict[str, Any]]:
     return out
 
 def _render_block_to_md(client: Client, blk: Dict[str, Any]) -> List[str]:
-    """Egy blokk (és gyerekei) markdown sorokká."""
     t = blk.get("type")
     payload = blk.get(t, {}) if t else {}
     has_children = blk.get("has_children", False)
@@ -239,10 +321,7 @@ def _render_block_to_md(client: Client, blk: Dict[str, Any]) -> List[str]:
         line = f"```{lang}\n{_maybe_fix_mojibake(code_text)}\n```"
     elif t == "divider":
         line = "---"
-    elif t == "toggle":
-        # A toggle maga is tartalom (idézet stílussal), a gyerekeit külön hozzátesszük
-        line = "> " + text
-    elif t in ("callout",):
+    elif t in ("toggle", "callout"):
         line = "> " + text
     elif t in ("column_list", "column", "synced_block", "synced_block_reference", "table", "table_row"):
         line = None
@@ -257,11 +336,6 @@ def _render_block_to_md(client: Client, blk: Dict[str, Any]) -> List[str]:
     return lines
 
 def _collect_section_from_children(client: Client, parent_id: str, heading: str) -> Optional[str]:
-    """Bejárja a parent közvetlen gyerekeit, és ha talál:
-       - heading_2 / heading_3 == heading → heading.children + következő H2/H3-ig tartó testvérblokkok
-       - toggle == heading → csak a toggle.children
-       Ha nincs találat, a gyerekeken rekurzívan keres tovább.
-    """
     heading_cmp = _norm_heading_cmp(heading)
     blocks = _list_children(client, parent_id)
 
@@ -274,14 +348,12 @@ def _collect_section_from_children(client: Client, parent_id: str, heading: str)
         if isinstance(payload, dict) and "rich_text" in payload:
             text = _rt(payload)
 
-        # 1) Ha H2/H3 egyezés
+        # 1) H2/H3 egyezés (toggle-elhető heading is ok → gyerekei + következő headingig testvérek)
         if t in ("heading_2", "heading_3") and _norm_heading_cmp(text) == heading_cmp:
             content_lines: List[str] = []
-            # heading gyerekei (toggle heading esetén)
             if blk.get("has_children", False):
                 for ch in _list_children(client, blk["id"]):
                     content_lines.extend(_render_block_to_md(client, ch))
-            # következő H2/H3-ig a testvérek
             j = i + 1
             while j < len(blocks):
                 nxt = blocks[j]
@@ -292,7 +364,7 @@ def _collect_section_from_children(client: Client, parent_id: str, heading: str)
             md = "\n".join(content_lines).strip()
             return _fix_numbered_lists(md) if md else ""
 
-        # 2) Ha sima toggle egyezés (a toggle címkéje a heading)
+        # 2) Sima toggle egyezés
         if t == "toggle" and _norm_heading_cmp(text) == heading_cmp:
             content_lines = []
             for ch in _list_children(client, blk["id"]):
@@ -300,23 +372,17 @@ def _collect_section_from_children(client: Client, parent_id: str, heading: str)
             md = "\n".join(content_lines).strip()
             return _fix_numbered_lists(md) if md else ""
 
-        # 3) Egyébként: ha van gyerek, lefelé keresünk
+        # 3) Rekurzív lejjebb
         if blk.get("has_children", False):
             found = _collect_section_from_children(client, blk["id"], heading)
             if found is not None:
                 return found
         i += 1
-
-    return None  # nincs találat ezen az ágon
+    return None
 
 def extract_section_content(client: Client, page_id: str, heading: str) -> str:
-    """Kinyeri a megadott szekció tartalmát blokk-szinten, toggle/heading esetekkel."""
-    try:
-        md = _collect_section_from_children(client, page_id, heading)
-        return md or ""
-    except APIResponseError:
-        # hívó oldalon kezeljük a hiba jelzését
-        raise
+    md = _collect_section_from_children(client, page_id, heading)
+    return md or ""
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Notion segédek
@@ -349,7 +415,7 @@ def _get_select_or_text(page: Dict[str, Any], prop_name: str) -> str:
     return ""
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Beolvasás (csak meta), majd később feldolgozás
+# Beolvasás (csak meta), majd később feldolgozás a választás szerint
 # ────────────────────────────────────────────────────────────────────────────────
 def _query_all_pages_meta(client: Client, database_id: str) -> List[Dict[str, Any]]:
     status = st.empty()
@@ -389,7 +455,7 @@ def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) 
         sorszam = _get_select_or_text(page, "Sorszám")
         szakasz = _get_select_or_text(page, "Szakasz")
 
-        # SZEKCIÓ KINYERÉS BLOKK-ALAPON
+        # Stabil, blokk-szintű kinyerés
         try:
             content = extract_section_content(client, page["id"], VIDEO_HEADING)
             chosen_type = VIDEO_HEADING if content else None
@@ -400,6 +466,7 @@ def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) 
         except APIResponseError as e:
             warn.warning(f"Blokkolvasás kihagyva: '{title}' (hiba: {getattr(e, 'code', 'ismeretlen')})")
             content = ""
+            chosen_type = None
 
         if not content:
             content = "Ehhez a leckéhez nem készült leírás."
@@ -520,14 +587,37 @@ def main():
     with st.expander("Csatlakozás ellenőrzése (opcionális)", expanded=False):
         st.write("**NOTION_API_KEY**:", _mask(api_key))
         st.write("**NOTION_DATABASE_ID (szabványosítva)**:", _mask(db_id))
-        if st.button("🔍 Teszt kapcsolat", use_container_width=True):
-            info = st.empty()
-            try:
-                meta = _with_retry(lambda: client.databases.retrieve(database_id=db_id), "Databases.retrieve", info)
-                title = "".join([t.get("plain_text", "") for t in meta.get("title", [])]) if meta.get("title") else ""
-                info.success(f"Siker! Adatbázis neve: **{title or '(nincs cím)'}**")
-            except APIResponseError as e:
-                info.error(f"Hiba: {getattr(e,'code','ismeretlen')}")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🔍 Teszt kapcsolat", use_container_width=True):
+                info = st.empty()
+                try:
+                    meta = _with_retry(lambda: client.databases.retrieve(database_id=db_id), "Databases.retrieve", info)
+                    title = "".join([t.get("plain_text", "") for t in meta.get("title", [])]) if meta.get("title") else ""
+                    info.success(f"Siker! Adatbázis neve: **{title or '(nincs cím)'}**")
+                except APIResponseError as e:
+                    info.error(f"Hiba: {getattr(e,'code','ismeretlen')}")
+        with c2:
+            if st.button("📋 10 soros minta (meta)", use_container_width=True):
+                try:
+                    resp = _with_retry(lambda: client.databases.query(database_id=db_id, page_size=10),
+                                       "Databases.query (sample)")
+                    sample_rows = []
+                    for pg in resp.get("results", []):
+                        sample_rows.append({
+                            "név": _get_title_from_page(pg),
+                            "kurzus": _get_select_or_text(pg, DEFAULT_GROUP_PROP) or "Ismeretlen",
+                            "sorszám": _get_select_or_text(pg, "Sorszám"),
+                            "szakasz": _get_select_or_text(pg, "Szakasz"),
+                            "page_id": (pg.get("id","") or "")[:8] + "…"
+                        })
+                    if sample_rows:
+                        st.dataframe(sample_rows, use_container_width=True, hide_index=True)
+                        st.caption(f"Minta sorok: {len(sample_rows)}")
+                    else:
+                        st.warning("A lekérdezés nem adott vissza sort.")
+                except APIResponseError as e:
+                    st.error(f"Hiba a minta-lekérdezésnél: {getattr(e,'code','ismeretlen')}")
 
     # 1) Beolvasás – csak meta
     st.markdown("### 1) Kurzusok beolvasása")
@@ -563,6 +653,14 @@ def main():
     )
     st.session_state["export_choice"] = choice
 
+    # Előzetes sor-szám becslés (oldalak száma)
+    pages_meta = st.session_state["pages_meta"]
+    total_pages = len(pages_meta)
+    if choice == "Kiválasztott kurzusok → CSV":
+        selected_pages_est = len(_filter_pages_by_courses(pages_meta, st.session_state["selected_courses"]))
+    else:
+        selected_pages_est = total_pages
+
     if choice == "Kiválasztott kurzusok → CSV":
         with st.container(border=True):
             left, right = st.columns([3, 1])
@@ -581,23 +679,24 @@ def main():
                 if colB.button("Törlés", use_container_width=True):
                     selected = []
             st.session_state["selected_courses"] = selected
-            st.caption(f"Kijelölt kurzusok: **{len(selected)}** / {len(st.session_state['courses'])}")
+            selected_pages_est = len(_filter_pages_by_courses(pages_meta, selected))
+            st.caption(f"Kijelölt kurzusok: **{len(selected)}** / {len(st.session_state['courses'])} • várható sorok: **{selected_pages_est}**")
 
-    # 3) Feldolgozás → Export (csak most indul a lassabb lépés!)
+    # 3) Feldolgozás és export (csak most indul a lassabb lépés)
     st.markdown("### 3) Feldolgozás és export")
-    export_label = {
-        "Minden egy CSV-ben": "▶️ Feldolgozás és export – MINDEN egy CSV-be",
-        "ZIP – kurzusonként": "▶️ Feldolgozás és export – kurzusonként ZIP",
-        "Kiválasztott kurzusok → CSV": "▶️ Feldolgozás és export – KIVÁLASZTOTT kurzusok"
-    }[choice]
+    export_label_map = {
+        "Minden egy CSV-ben": f"▶️ Feldolgozás és export – MINDEN egy CSV-be ({total_pages} sor)",
+        "ZIP – kurzusonként": f"▶️ Feldolgozás és export – kurzusonként ZIP ({selected_pages_est} sor)",
+        "Kiválasztott kurzusok → CSV": f"▶️ Feldolgozás és export – KIVÁLASZTOTT kurzusok ({selected_pages_est} sor)"
+    }
     export_type = "primary" if choice == "Minden egy CSV-ben" else "secondary"
-    go = st.button(export_label, type=export_type, use_container_width=True)
+    go = st.button(export_label_map[choice], type=export_type, use_container_width=True)
 
     if not go:
         st.info("Állítsd be az export módot, majd indítsd a feldolgozást a fenti gombbal.")
         return
 
-    pages_meta = st.session_state["pages_meta"]
+    # oldalak szűrése a választás szerint, majd tényleges feldolgozás
     if choice == "Kiválasztott kurzusok → CSV":
         pages_to_process = _filter_pages_by_courses(pages_meta, st.session_state["selected_courses"])
         if not pages_to_process:
@@ -608,12 +707,13 @@ def main():
 
     rows = _rows_from_pages_with_progress(client, pages_to_process)
 
+    # Letöltés(ek)
     if choice == "Minden egy CSV-ben":
         csv_bytes = _csv_bytes(rows)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.success(f"Kész: {len(rows)} sor egy CSV-ben.")
         st.download_button(
-            label="CSV letöltése",
+            label=f"CSV letöltése – {len(rows)} sor",
             data=csv_bytes,
             file_name=f"export_minden_{ts}.csv",
             mime="text/csv",
@@ -626,7 +726,7 @@ def main():
         ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.success(f"Kész: {len(rows)} sor, kurzusonként csoportosítva (ZIP).")
         st.download_button(
-            label="ZIP letöltése",
+            label=f"ZIP letöltése – {len(rows)} sor",
             data=zip_bytes,
             file_name=f"export_kurzusonként_{ts2}.zip",
             mime="application/zip",
@@ -639,7 +739,7 @@ def main():
         ts3 = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.success(f"Kész: {len(rows)} sor a kijelölt kurzus(ok)ból.")
         st.download_button(
-            label="CSV letöltése (kiválasztott kurzusok)",
+            label=f"CSV letöltése (kiválasztott kurzusok – {len(rows)} sor)",
             data=csv_bytes,
             file_name=f"export_kiválasztott_{ts3}.csv",
             mime="text/csv",
