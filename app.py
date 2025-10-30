@@ -21,9 +21,8 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY", st.secrets.get("NOTION_API_KEY", ""
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", st.secrets.get("NOTION_DATABASE_ID", ""))
 APP_PASSWORD = os.getenv("APP_PASSWORD", st.secrets.get("APP_PASSWORD", ""))
 
-CSV_FIELDNAMES = ["kurzus", "sorszám", "név", "típus", "tartalom"]
+CSV_FIELDNAMES_BASE = ["kurzus", "sorszám", "név", "típus", "tartalom"]
 
-# Csak EZEKET a H2-ket figyeljük (pontos egyezés, ékezetekkel!)
 VIDEO_HEADING = "Videó szöveg"
 LESSON_HEADING = "Lecke szöveg"
 
@@ -100,7 +99,7 @@ def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
         part = text[start:end].rstrip()
         if part:
             parts.append(part)
-        start = end
+        start = end if end > start else len(text)
 
     out: Dict[str, str] = {}
     for i, p in enumerate(parts):
@@ -168,17 +167,14 @@ def blocks_to_md(client: Client, block_id: str) -> str:
                 elif t == "divider":
                     line = "---"
                 elif t in ("callout", "toggle"):
-                    # a toggle/callout címe jelenjen meg idézetként
                     if text:
                         line = "> " + text
                 elif t in ("column_list", "column", "synced_block", "synced_block_reference", "table", "table_row"):
-                    # Ezeknél csak a gyerekek érdekesek
                     line = None
 
                 if line is not None and str(line).strip() != "":
                     acc.append(line)
 
-                # Rekurzív bejárás minden gyereken
                 if has_children:
                     walk(blk["id"], acc)
 
@@ -206,7 +202,209 @@ def _extract_section_exact(md: str, heading: str) -> str:
     if not m:
         return ""
     start = m.end()
-    # Következő H2/H3
     m2 = re.search(r"^##{1,2}\s+.+$", md[start:], flags=re.MULTILINE)
     raw = md[start:start + (m2.start() if m2 else len(md))].strip()
     return raw if raw.strip() else ""
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Notion segédek
+# ────────────────────────────────────────────────────────────────────────────────
+def _get_title_from_page(page: Dict[str, Any]) -> str:
+    props = page.get("properties", {})
+    for name, prop in props.items():
+        if prop.get("type") == "title":
+            return "".join([t.get("plain_text", "") for t in prop.get("title", [])]).strip()
+    # fallback
+    return page.get("id", "")
+
+def _get_select_or_text(page: Dict[str, Any], prop_name: str) -> str:
+    props = page.get("properties", {})
+    prop = props.get(prop_name)
+    if not prop:
+        return ""
+    t = prop.get("type")
+    if t == "select":
+        sel = prop.get("select")
+        return (sel or {}).get("name", "") if sel else ""
+    if t == "multi_select":
+        return ", ".join([x.get("name", "") for x in prop.get("multi_select", [])])
+    if t == "rich_text":
+        return "".join([rt.get("plain_text", "") for rt in prop.get("rich_text", [])]).strip()
+    if t == "number":
+        num = prop.get("number", None)
+        return "" if num is None else str(num)
+    if t == "status":
+        stt = prop.get("status")
+        return (stt or {}).get("name", "") if stt else ""
+    return ""
+
+def _query_all_pages(client: Client, database_id: str) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        resp = client.databases.query(database_id=database_id, start_cursor=cursor) if cursor else client.databases.query(database_id=database_id)
+        results.extend(resp.get("results", []))
+        if resp.get("has_more"):
+            cursor = resp.get("next_cursor")
+        else:
+            break
+    return results
+
+# ────────────────────────────────────────────────────────────────────────────────
+# CSV építés
+# ────────────────────────────────────────────────────────────────────────────────
+def _rows_from_pages(client: Client, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for page in pages:
+        title = _get_title_from_page(page)
+        group = _get_select_or_text(page, DEFAULT_GROUP_PROP) or "Ismeretlen"
+        sorszam = _get_select_or_text(page, "Sorszám")
+        szakasz = _get_select_or_text(page, "Szakasz")
+
+        md = blocks_to_md(client, page["id"])
+        chosen_type = None
+        content = _extract_section_exact(md, VIDEO_HEADING)
+        if content:
+            chosen_type = VIDEO_HEADING
+        else:
+            content = _extract_section_exact(md, LESSON_HEADING)
+            if content:
+                chosen_type = LESSON_HEADING
+
+        if not content:
+            content = "Ehhez a leckéhez nem készült leírás."
+
+        # Alap sor
+        base = {
+            "kurzus": group or "",
+            "sorszám": sorszam or "",
+            "név": title or "",
+            "típus": chosen_type or "",
+        }
+        # Tartalom darabolása
+        pieces = _split_content_for_csv(content, MAX_CONTENT_CHARS)
+        row = {**base, **pieces}
+        rows.append(_norm_csv_row(row))
+    return rows
+
+def _group_by(rows: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
+    g: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        g.setdefault(r.get(key, "Ismeretlen") or "Ismeretlen", []).append(r)
+    return g
+
+def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    # Fejléc: union az összes kulcsból, de a base oszlopok sorrendje legyen elöl
+    header_set = set()
+    for r in rows:
+        header_set.update(r.keys())
+    base = [c for c in CSV_FIELDNAMES_BASE if c in header_set]
+    rest = [c for c in sorted(header_set) if c not in base]
+    headers = base + rest
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    data = buf.getvalue().encode("utf-8-sig")  # BOM
+    return data
+
+def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> bytes:
+    groups = _group_by(rows, group_key)
+    files = []
+    for group, items in groups.items():
+        csv_bytes = _csv_bytes(items)
+        fname = f"{_slug(group) or 'ismeretlen'}.csv"
+        files.append((fname, csv_bytes))
+    return _zip_utf8(files)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ────────────────────────────────────────────────────────────────────────────────
+def _check_secrets():
+    missing = []
+    if not NOTION_API_KEY:
+        missing.append("NOTION_API_KEY")
+    if not NOTION_DATABASE_ID:
+        missing.append("NOTION_DATABASE_ID")
+    if missing:
+        st.error("Hiányzó beállítások: " + ", ".join(missing))
+        st.info("Állítsd be környezeti változóként vagy a Streamlit secrets-ben.")
+        st.stop()
+
+def _password_gate():
+    if not APP_PASSWORD:
+        return True
+    st.session_state.setdefault("_auth_ok", False)
+    if st.session_state["_auth_ok"]:
+        return True
+    pw = st.text_input("Jelszó", type="password")
+    if st.button("Belépés"):
+        if pw == APP_PASSWORD:
+            st.session_state["_auth_ok"] = True
+            return True
+        else:
+            st.error("Hibás jelszó.")
+    st.stop()
+
+@st.cache_data(show_spinner=False)
+def _cached_pages(api_key: str, dbid: str) -> List[Dict[str, Any]]:
+    cli = Client(auth=api_key)
+    return _query_all_pages(cli, dbid)
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
+    st.title(APP_TITLE)
+    st.caption("Notion adatbázis → CSV export. A 'Videó szöveg' / 'Lecke szöveg' szakaszok kinyerése, toggle/oszlop alatt is.")
+
+    _check_secrets()
+    _password_gate()
+
+    client = Client(auth=NOTION_API_KEY)
+
+    with st.spinner("Oldalak beolvasása a Notionből..."):
+        pages = _cached_pages(NOTION_API_KEY, NOTION_DATABASE_ID)
+
+    st.success(f"{len(pages)} oldal beolvasva a Notion adatbázisból.")
+
+    # Export gombok
+    col1, col2, col3 = st.columns([1,1,2])
+    with col1:
+        if st.button("Előnézet (első 10 sor)"):
+            rows_preview = _rows_from_pages(client, pages[:10])
+            import pandas as pd
+            df = pd.DataFrame(rows_preview)
+            st.dataframe(df, use_container_width=True)
+
+    with col2:
+        if st.button("Kurzusonként külön CSV (ZIP)"):
+            rows = _rows_from_pages(client, pages)
+            zip_bytes = _zip_by_group(rows)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label="ZIP letöltése",
+                data=zip_bytes,
+                file_name=f"export_kurzusonként_{ts}.zip",
+                mime="application/zip",
+            )
+
+    with col3:
+        if st.button("Minden egy CSV-ben"):
+            rows = _rows_from_pages(client, pages)
+            csv_bytes = _csv_bytes(rows)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label="CSV letöltése",
+                data=csv_bytes,
+                file_name=f"export_minden_{ts}.csv",
+                mime="text/csv",
+            )
+
+    with st.expander("Beállítások / infó", expanded=False):
+        st.write("**Csoportosítás property**:", DEFAULT_GROUP_PROP)
+        st.write("**MAX_CONTENT_CHARS**:", MAX_CONTENT_CHARS)
+        st.write("A keresett címsorok:", f"'{VIDEO_HEADING}' vagy '{LESSON_HEADING}' (## vagy ###, ':' megengedett)")
+
+if __name__ == "__main__":
+    main()
