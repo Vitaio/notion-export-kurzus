@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -10,6 +9,7 @@ from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from notion_client import Client
+from notion_client.errors import APIResponseError
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Alapbeállítások
@@ -18,8 +18,8 @@ APP_TITLE = "Notion → CSV Export – Kurzus"
 DEFAULT_GROUP_PROP = os.getenv("NOTION_PROPERTY_NAME", st.secrets.get("NOTION_PROPERTY_NAME", "Kurzus"))
 MAX_CONTENT_CHARS = int(os.getenv("MAX_CONTENT_CHARS", st.secrets.get("MAX_CONTENT_CHARS", 40000)))
 
-NOTION_API_KEY = os.getenv("NOTION_API_KEY", st.secrets.get("NOTION_API_KEY", ""))
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", st.secrets.get("NOTION_DATABASE_ID", ""))
+RAW_NOTION_API_KEY = os.getenv("NOTION_API_KEY", st.secrets.get("NOTION_API_KEY", ""))
+RAW_NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", st.secrets.get("NOTION_DATABASE_ID", ""))
 APP_PASSWORD = os.getenv("APP_PASSWORD", st.secrets.get("APP_PASSWORD", ""))
 
 CSV_FIELDNAMES_BASE = ["kurzus", "sorszám", "név", "típus", "tartalom"]
@@ -63,6 +63,34 @@ def _norm_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 # ────────────────────────────────────────────────────────────────────────────────
+# ID / beállítás segédek
+# ────────────────────────────────────────────────────────────────────────────────
+def _mask(s: str, show: int = 6) -> str:
+    s = s or ""
+    if len(s) <= show:
+        return s
+    return s[:show] + "…"
+
+def _extract_uuid_like(s: str) -> str:
+    """Teljes Notion URL-ből is kinyeri a DB azonosítót."""
+    if not s:
+        return ""
+    s = s.strip()
+    # hyphenated
+    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", s)
+    if m:
+        return m.group(1)
+    # 32 hex
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    if m:
+        u = m.group(1)
+        return f"{u[0:8]}-{u[8:12]}-{u[12:16]}-{u[16:20]}-{u[20:32]}"
+    return s  # ha semmi nem illik, visszaadjuk az eredetit (lehet, hogy már jó)
+
+def _sanitize_db_id(raw: str) -> str:
+    return _extract_uuid_like(raw)
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Segédfüggvények
 # ────────────────────────────────────────────────────────────────────────────────
 def _slug(s: str) -> str:
@@ -94,7 +122,7 @@ def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
     while start < len(text):
         end = min(len(text), start + max_len)
         window = text[start:end]
-        cut = window.rfind("\\n\\n")
+        cut = window.rfind("\n\n")
         if cut >= int(max_len * 0.6):
             end = start + cut
         part = text[start:end].rstrip()
@@ -111,12 +139,12 @@ def _fix_numbered_lists(md: str) -> str:
     lines = md.splitlines()
     n = 1
     for i, line in enumerate(lines):
-        if re.match(r"^\\s*\\d+\\.\\s", line):
-            lines[i] = re.sub(r"^\\s*\\d+\\.\\s", f"{n}. ", line)
+        if re.match(r"^\s*\d+\.\s", line):
+            lines[i] = re.sub(r"^\s*\d+\.\s", f"{n}. ", line)
             n += 1
         elif line.strip() == "":
             n = 1
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Notion → Markdown (rekurzív bejárás, kezeli toggle/column/callout)
@@ -128,7 +156,12 @@ def blocks_to_md(client: Client, block_id: str) -> str:
     def walk(bid: str, acc: List[str]):
         cursor = None
         while True:
-            resp = client.blocks.children.list(block_id=bid, start_cursor=cursor) if cursor else client.blocks.children.list(block_id=bid)
+            try:
+                resp = client.blocks.children.list(block_id=bid, start_cursor=cursor) if cursor else client.blocks.children.list(block_id=bid)
+            except APIResponseError as e:
+                st.error(f"Notion blokkolvasás hiba: {e.code}. Ellenőrizd, hogy az integráció látja-e az oldalt.")
+                raise
+
             for blk in resp.get("results", []):
                 t = blk.get("type")
                 payload = blk.get(t, {}) if t else {}
@@ -159,7 +192,7 @@ def blocks_to_md(client: Client, block_id: str) -> str:
                 elif t == "code":
                     code_text = "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
                     lang = payload.get("language", "")
-                    line = f"```{lang}\\n{_maybe_fix_mojibake(code_text)}\\n```"
+                    line = f"```{lang}\n{_maybe_fix_mojibake(code_text)}\n```"
                 elif t == "divider":
                     line = "---"
                 elif t in ("callout", "toggle"):
@@ -181,24 +214,18 @@ def blocks_to_md(client: Client, block_id: str) -> str:
 
     out_lines: List[str] = []
     walk(block_id, out_lines)
-    md = "\\n".join(out_lines).strip()
+    md = "\n".join(out_lines).strip()
     return _fix_numbered_lists(md)
 
 def _extract_section_exact(md: str, heading: str) -> str:
-    """
-    Rugalmas egyezés a megadott címsorra:
-    - H2 vagy H3 (## / ###)
-    - kis/nagybetű független
-    - opcionális kettőspont a végén
-    A kijelölt H2/H3-tól a KÖVETKEZŐ H2/H3-ig vágunk.
-    """
-    md = (unicodedata.normalize("NFC", md or "")).replace("\\u00A0", " ")
-    pat = re.compile(rf"^##{{1,2}}\\s*{re.escape(heading)}\\s*:?\\s*$", flags=re.MULTILINE | re.IGNORECASE)
+    """H2/H3 címsor: kis/nagybetű független, opcionális ':'."""
+    md = (_normalize_unicode(md) or "").replace("\u00A0", " ")
+    pat = re.compile(rf"^#{2,3}\s*{re.escape(heading)}\s*:?\s*$", flags=re.MULTILINE | re.IGNORECASE)
     m = pat.search(md)
     if not m:
         return ""
     start = m.end()
-    m2 = re.search(r"^##{1,2}\\s+.+$", md[start:], flags=re.MULTILINE)
+    m2 = re.search(r"^#{2,3}\s+.+$", md[start:], flags=re.MULTILINE)
     raw = md[start:start + (m2.start() if m2 else len(md))].strip()
     return raw if raw.strip() else ""
 
@@ -236,7 +263,7 @@ def _get_select_or_text(page: Dict[str, Any], prop_name: str) -> str:
 # I/O + CSV építés
 # ────────────────────────────────────────────────────────────────────────────────
 def _query_all_pages_with_status(client: Client, database_id: str) -> List[Dict[str, Any]]:
-    """Oldalak beolvasása státusz kijelzéssel."""
+    """Oldalak beolvasása státusz kijelzéssel + stabil hibaüzenetek."""
     status = st.empty()
     pages: List[Dict[str, Any]] = []
     cursor = None
@@ -244,7 +271,11 @@ def _query_all_pages_with_status(client: Client, database_id: str) -> List[Dict[
     while True:
         batch += 1
         status.info(f"Notion lekérdezés… (batch {batch}, eddig {len(pages)} oldal)")
-        resp = client.databases.query(database_id=database_id, start_cursor=cursor) if cursor else client.databases.query(database_id=database_id)
+        try:
+            resp = client.databases.query(database_id=database_id, start_cursor=cursor) if cursor else client.databases.query(database_id=database_id)
+        except APIResponseError as e:
+            _render_api_error_hint(e, where="Databases.query")
+            st.stop()
         pages.extend(resp.get("results", []))
         if resp.get("has_more"):
             cursor = resp.get("next_cursor")
@@ -254,7 +285,7 @@ def _query_all_pages_with_status(client: Client, database_id: str) -> List[Dict[
     return pages
 
 def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sorok építése előrehaladás jelzéssel."""
+    """Sorok építése előrehaladás jelzéssel + hibatűrés blokkolvasáskor."""
     rows: List[Dict[str, Any]] = []
     n = len(pages)
     prog = st.progress(0.0)
@@ -265,7 +296,12 @@ def _rows_from_pages_with_progress(client: Client, pages: List[Dict[str, Any]]) 
         sorszam = _get_select_or_text(page, "Sorszám")
         szakasz = _get_select_or_text(page, "Szakasz")
 
-        md = blocks_to_md(client, page["id"])
+        try:
+            md = blocks_to_md(client, page["id"])
+        except APIResponseError as e:
+            st.warning(f"Blokkolvasás kihagyva ennél az oldalon: '{title}' (hiba: {e.code})")
+            md = ""
+
         chosen_type = None
         content = _extract_section_exact(md, VIDEO_HEADING)
         if content:
@@ -320,13 +356,30 @@ def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> byte
     return _zip_utf8(files)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streamlit UI (gombnyomásra indul, haladás kijelzés, fő gomb kiemelve)
+# Hibákhoz magyarázat
+# ────────────────────────────────────────────────────────────────────────────────
+def _render_api_error_hint(e: APIResponseError, where: str):
+    st.error(f"Notion API hiba ({where}): **{e.code}**")
+    hints = {
+        "unauthorized": "Érvénytelen vagy hiányzó NOTION_API_KEY. Ellenőrizd a token értékét.",
+        "restricted_resource": "Az integráció nincs megosztva ezzel az erőforrással. A Notionban: Share → **Add connections** → válaszd ki az integrációdat.",
+        "object_not_found": "A megadott Database ID nem található vagy nincs jogosultságod. Ellenőrizd az azonosítót (URL-ből kivágott UUID is jó).",
+        "validation_error": "Érvénytelen paraméter (pl. hibás ID formátum). Ellenőrizd, hogy a Database ID UUID formátumú.",
+        "rate_limited": "Rate limit. Próbáld meg később vagy csökkentsd a kérések számát.",
+        "conflict_error": "Konfliktusos kérés. Próbáld meg újra.",
+        "internal_server_error": "Notion szerverhiba. Próbáld meg újra.",
+    }
+    msg = hints.get(getattr(e, "code", ""), "Ismeretlen hiba. Ellenőrizd: token, DB ID, megosztás az integrációnak.")
+    st.info(msg)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
 # ────────────────────────────────────────────────────────────────────────────────
 def _check_secrets():
     missing = []
-    if not NOTION_API_KEY:
+    if not RAW_NOTION_API_KEY:
         missing.append("NOTION_API_KEY")
-    if not NOTION_DATABASE_ID:
+    if not RAW_NOTION_DATABASE_ID:
         missing.append("NOTION_DATABASE_ID")
     if missing:
         st.error("Hiányzó beállítások: " + ", ".join(missing))
@@ -358,7 +411,7 @@ def main():
     st.title(APP_TITLE)
     st.caption("Notion adatbázis → CSV export. A 'Videó szöveg' / 'Lecke szöveg' szakaszok kinyerése, toggle/oszlop alatt is.")
 
-    # Fő gomb hangsúly + finom UI
+    # UI finomhangolás: fő gomb hangsúly
     st.markdown("""
     <style>
     .primary-big button {font-size:1.08rem; padding:0.9rem 1rem; font-weight:700;}
@@ -369,7 +422,25 @@ def main():
     _check_secrets()
     _password_gate()
 
-    client = Client(auth=NOTION_API_KEY)
+    api_key = RAW_NOTION_API_KEY.strip()
+    db_id = _sanitize_db_id(RAW_NOTION_DATABASE_ID)
+
+    st.markdown("### Diagnosztika")
+    with st.expander("Csatlakozás ellenőrzése", expanded=True):
+        st.write("**NOTION_API_KEY**:", _mask(api_key))
+        st.write("**NOTION_DATABASE_ID (szabványosítva)**:", _mask(db_id))
+        client = Client(auth=api_key)
+        if st.button("🔍 Teszt kapcsolat (adatbázis meta lekérése)", use_container_width=True):
+            try:
+                meta = client.databases.retrieve(database_id=db_id)
+                title = ""
+                props = meta.get("title", [])
+                if props:
+                    title = "".join([t.get("plain_text", "") for t in props])
+                st.success(f"Siker! Adatbázis neve: **{title or '(nincs cím)'}**")
+            except APIResponseError as e:
+                _render_api_error_hint(e, where="Databases.retrieve")
+                st.stop()
 
     st.markdown("### Export mód")
     colA, colB = st.columns([1.6, 1])
@@ -377,15 +448,17 @@ def main():
     run_zip = colB.button("ZIP – kurzusonként külön CSV", type="secondary", use_container_width=True, key="run_zip")
 
     if not (run_all or run_zip):
-        st.info("Válassz export módot a fenti gombokkal. A feldolgozás csak gombnyomásra indul.")
-        st.stop()
+        st.info("Válassz export módot fent. A feldolgozás csak gombnyomásra indul.")
+        return
+
+    client = Client(auth=api_key)
 
     # 1) Beolvasás
     st.markdown("#### 1) Oldalak beolvasása")
-    pages = _query_all_pages_with_status(client, NOTION_DATABASE_ID)
+    pages = _query_all_pages_with_status(client, db_id)
     if not pages:
         st.warning("Nem érkezett oldal a Notionből.")
-        st.stop()
+        return
 
     # 2) Feldolgozás
     st.markdown("#### 2) Tartalom feldolgozása")
