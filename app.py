@@ -1,3 +1,4 @@
+
 import os
 import io
 import re
@@ -5,7 +6,7 @@ import csv
 import unicodedata
 import zipfile
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from notion_client import Client
@@ -93,7 +94,7 @@ def _split_content_for_csv(text: str, max_len: int) -> Dict[str, str]:
     while start < len(text):
         end = min(len(text), start + max_len)
         window = text[start:end]
-        cut = window.rfind("\n\n")
+        cut = window.rfind("\\n\\n")
         if cut >= int(max_len * 0.6):
             end = start + cut
         part = text[start:end].rstrip()
@@ -110,22 +111,17 @@ def _fix_numbered_lists(md: str) -> str:
     lines = md.splitlines()
     n = 1
     for i, line in enumerate(lines):
-        if re.match(r"^\s*\d+\.\s", line):
-            lines[i] = re.sub(r"^\s*\d+\.\s", f"{n}. ", line)
+        if re.match(r"^\\s*\\d+\\.\\s", line):
+            lines[i] = re.sub(r"^\\s*\\d+\\.\\s", f"{n}. ", line)
             n += 1
         elif line.strip() == "":
             n = 1
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Notion → Markdown
+# Notion → Markdown (rekurzív, kezeli a toggle/column/callout-ot)
 # ────────────────────────────────────────────────────────────────────────────────
 def blocks_to_md(client: Client, block_id: str) -> str:
-    """
-    Bejárja a teljes blokkfát (rekurzívan), és egyszerű Markdownná alakítja.
-    Kezeli a beágyazott (oszlopok, toggle, callout, synced_block stb.) struktúrákat is,
-    így a belső H2/H3 címsorok is bekerülnek a kimenetbe.
-    """
     def rt(payload: Dict[str, Any]) -> str:
         return "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
 
@@ -154,7 +150,7 @@ def blocks_to_md(client: Client, block_id: str) -> str:
                 elif t == "bulleted_list_item":
                     line = "- " + text
                 elif t == "numbered_list_item":
-                    line = "1. " + text  # később normalizáljuk
+                    line = "1. " + text
                 elif t == "quote":
                     line = "> " + text
                 elif t == "to_do":
@@ -163,7 +159,7 @@ def blocks_to_md(client: Client, block_id: str) -> str:
                 elif t == "code":
                     code_text = "".join([r.get("plain_text", "") for r in payload.get("rich_text", [])])
                     lang = payload.get("language", "")
-                    line = f"```{lang}\n{_maybe_fix_mojibake(code_text)}\n```"
+                    line = f"```{lang}\\n{_maybe_fix_mojibake(code_text)}\\n```"
                 elif t == "divider":
                     line = "---"
                 elif t in ("callout", "toggle"):
@@ -185,24 +181,24 @@ def blocks_to_md(client: Client, block_id: str) -> str:
 
     out_lines: List[str] = []
     walk(block_id, out_lines)
-    md = "\n".join(out_lines).strip()
+    md = "\\n".join(out_lines).strip()
     return _fix_numbered_lists(md)
 
 def _extract_section_exact(md: str, heading: str) -> str:
     """
-    Rugalmasabb egyezés a megadott címsorra:
+    Rugalmas egyezés a megadott címsorra:
     - H2 vagy H3 (## / ###)
-    - kis/nagybetű független egyezés
+    - kis/nagybetű független
     - opcionális kettőspont a végén
     A kijelölt H2/H3-tól a KÖVETKEZŐ H2/H3-ig vágunk.
     """
-    md = (_normalize_unicode(md) or "").replace("\u00A0", " ")
-    pat = re.compile(rf"^##{{1,2}}\s*{re.escape(heading)}\s*:?\s*$", flags=re.MULTILINE | re.IGNORECASE)
+    md = (unicodedata.normalize("NFC", md or "")).replace("\\u00A0", " ")
+    pat = re.compile(rf"^##{{1,2}}\\s*{re.escape(heading)}\\s*:?\\s*$", flags=re.MULTILINE | re.IGNORECASE)
     m = pat.search(md)
     if not m:
         return ""
     start = m.end()
-    m2 = re.search(r"^##{1,2}\s+.+$", md[start:], flags=re.MULTILINE)
+    m2 = re.search(r"^##{1,2}\\s+.+$", md[start:], flags=re.MULTILINE)
     raw = md[start:start + (m2.start() if m2 else len(md))].strip()
     return raw if raw.strip() else ""
 
@@ -211,15 +207,13 @@ def _extract_section_exact(md: str, heading: str) -> str:
 # ────────────────────────────────────────────────────────────────────────────────
 def _get_title_from_page(page: Dict[str, Any]) -> str:
     props = page.get("properties", {})
-    for name, prop in props.items():
+    for _, prop in props.items():
         if prop.get("type") == "title":
             return "".join([t.get("plain_text", "") for t in prop.get("title", [])]).strip()
-    # fallback
     return page.get("id", "")
 
 def _get_select_or_text(page: Dict[str, Any], prop_name: str) -> str:
-    props = page.get("properties", {})
-    prop = props.get(prop_name)
+    prop = page.get("properties", {}).get(prop_name)
     if not prop:
         return ""
     t = prop.get("type")
@@ -274,14 +268,12 @@ def _rows_from_pages(client: Client, pages: List[Dict[str, Any]]) -> List[Dict[s
         if not content:
             content = "Ehhez a leckéhez nem készült leírás."
 
-        # Alap sor
         base = {
             "kurzus": group or "",
             "sorszám": sorszam or "",
             "név": title or "",
-            "típus": chosen_type or "",
+            "típus": chosen_type or (szakasz or ""),
         }
-        # Tartalom darabolása
         pieces = _split_content_for_csv(content, MAX_CONTENT_CHARS)
         row = {**base, **pieces}
         rows.append(_norm_csv_row(row))
@@ -294,7 +286,6 @@ def _group_by(rows: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, 
     return g
 
 def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    # Fejléc: union az összes kulcsból, de a base oszlopok sorrendje legyen elöl
     header_set = set()
     for r in rows:
         header_set.update(r.keys())
@@ -307,8 +298,7 @@ def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
-    data = buf.getvalue().encode("utf-8-sig")  # BOM
-    return data
+    return buf.getvalue().encode("utf-8-sig")  # BOM
 
 def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> bytes:
     groups = _group_by(rows, group_key)
@@ -320,7 +310,7 @@ def _zip_by_group(rows: List[Dict[str, Any]], group_key: str = "kurzus") -> byte
     return _zip_utf8(files)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streamlit UI
+# Streamlit UI (preview nélkül, jelszópanel eltűnik belépés után; fő gomb kiemelve)
 # ────────────────────────────────────────────────────────────────────────────────
 def _check_secrets():
     missing = []
@@ -339,13 +329,18 @@ def _password_gate():
     st.session_state.setdefault("_auth_ok", False)
     if st.session_state["_auth_ok"]:
         return True
-    pw = st.text_input("Jelszó", type="password")
-    if st.button("Belépés"):
-        if pw == APP_PASSWORD:
-            st.session_state["_auth_ok"] = True
-            return True
-        else:
-            st.error("Hibás jelszó.")
+
+    with st.form("auth_form", clear_on_submit=True):
+        st.markdown("### Belépés")
+        pw = st.text_input("Jelszó", type="password")
+        ok = st.form_submit_button("Belépés", use_container_width=True)
+        if ok:
+            if pw == APP_PASSWORD:
+                st.session_state["_auth_ok"] = True
+                st.success("Sikeres belépés.")
+                st.experimental_rerun()
+            else:
+                st.error("Hibás jelszó.")
     st.stop()
 
 @st.cache_data(show_spinner=False)
@@ -358,6 +353,13 @@ def main():
     st.title(APP_TITLE)
     st.caption("Notion adatbázis → CSV export. A 'Videó szöveg' / 'Lecke szöveg' szakaszok kinyerése, toggle/oszlop alatt is.")
 
+    st.markdown("""
+    <style>
+    .big-primary button {font-size:1.08rem; padding:0.9rem 1rem; font-weight:700;}
+    .secondary button {opacity:0.95;}
+    </style>
+    """, unsafe_allow_html=True)
+
     _check_secrets()
     _password_gate()
 
@@ -366,45 +368,42 @@ def main():
     with st.spinner("Oldalak beolvasása a Notionből..."):
         pages = _cached_pages(NOTION_API_KEY, NOTION_DATABASE_ID)
 
-    st.success(f"{len(pages)} oldal beolvasva a Notion adatbázisból.")
+    rows = _rows_from_pages(client, pages)
 
-    # Export gombok
-    col1, col2, col3 = st.columns([1,1,2])
-    with col1:
-        if st.button("Előnézet (első 10 sor)"):
-            rows_preview = _rows_from_pages(client, pages[:10])
-            import pandas as pd
-            df = pd.DataFrame(rows_preview)
-            st.dataframe(df, use_container_width=True)
-
-    with col2:
-        if st.button("Kurzusonként külön CSV (ZIP)"):
-            rows = _rows_from_pages(client, pages)
-            zip_bytes = _zip_by_group(rows)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button(
-                label="ZIP letöltése",
-                data=zip_bytes,
-                file_name=f"export_kurzusonként_{ts}.zip",
-                mime="application/zip",
-            )
-
-    with col3:
-        if st.button("Minden egy CSV-ben"):
-            rows = _rows_from_pages(client, pages)
-            csv_bytes = _csv_bytes(rows)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button(
-                label="CSV letöltése",
-                data=csv_bytes,
-                file_name=f"export_minden_{ts}.csv",
-                mime="text/csv",
-            )
+    st.markdown("### Export")
+    colA, colB = st.columns([1.5, 1])
+    with colA:
+        csv_bytes = _csv_bytes(rows)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            label="⬇️ Minden egy CSV-ben",
+            data=csv_bytes,
+            file_name=f"export_minden_{ts}.csv",
+            mime="text/csv",
+            type="primary",
+            use_container_width=True,
+            key="dl_all",
+            help="Az összes oldal egyetlen CSV fájlban (UTF-8 BOM)",
+        )
+    with colB:
+        zip_bytes = _zip_by_group(rows, group_key="kurzus")
+        ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            label="ZIP – kurzusonként külön CSV",
+            data=zip_bytes,
+            file_name=f"export_kurzusonként_{ts2}.zip",
+            mime="application/zip",
+            type="secondary",
+            use_container_width=True,
+            key="dl_zip",
+            help="Minden kurzus saját CSV-ben, ZIP-be csomagolva",
+        )
 
     with st.expander("Beállítások / infó", expanded=False):
         st.write("**Csoportosítás property**:", DEFAULT_GROUP_PROP)
         st.write("**MAX_CONTENT_CHARS**:", MAX_CONTENT_CHARS)
         st.write("A keresett címsorok:", f"'{VIDEO_HEADING}' vagy '{LESSON_HEADING}' (## vagy ###, ':' megengedett)")
+        st.write(f"Összes oldal: {len(pages)} • Export sorok: {len(rows)}")
 
 if __name__ == "__main__":
     main()
